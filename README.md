@@ -121,6 +121,14 @@ Crypto-Monitoring/
 
 本项目采用 [GNU General Public License v3.0](./LICENSE) 发布。
 
+## 请作者喝杯咖啡
+
+如果这个项目对你有帮助，欢迎通过微信扫码请作者喝杯咖啡，支持项目持续维护与改进。
+
+<div align="center">
+  <img src="./assets/coffee-wechat.png" alt="微信赞赏二维码" width="260">
+</div>
+
 ## 关于项目
 
 Crypto Monitoring 由开发者社区维护，目标是提供一个清晰、快速且安全边界明确的 macOS 加密货币监控入口。项目主页：[nunter/Crypto-Monitoring](https://github.com/nunter/Crypto-Monitoring)。
