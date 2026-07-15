@@ -1,0 +1,97 @@
+//
+//  CryptoSymbol.swift
+//  Crypto Monitoring
+//
+//  Created by Mark on 2025/10/29.
+//
+
+import Foundation
+
+/// 支持的主流虚拟货币枚举
+/// 提供API符号、展示名称和图标信息
+enum CryptoSymbol: String, CaseIterable, Codable {
+    case btc = "BTCUSDT"
+    case eth = "ETHUSDT"
+    case bnb = "BNBUSDT"
+    case sol = "SOLUSDT"
+    case doge = "DOGEUSDT"
+
+    /// 用于展示的币种简称
+    var displayName: String {
+        switch self {
+        case .btc:
+            return "BTC"
+        case .eth:
+            return "ETH"
+        case .bnb:
+            return "BNB"
+        case .sol:
+            return "SOL"
+        case .doge:
+            return "DOGE"
+        }
+    }
+
+    /// 币安API使用的交易对符号
+    var apiSymbol: String {
+        return rawValue
+    }
+
+    /// 菜单中展示的交易对名称
+    var pairDisplayName: String {
+        return "\(displayName)/USDT"
+    }
+
+    /// 对应的SF Symbols图标名称
+    var systemImageName: String {
+        switch self {
+        case .btc:
+            return "bitcoinsign.circle.fill"
+        case .eth:
+            return "hexagon.fill"
+        case .bnb:
+            return "diamond.fill"
+        case .sol:
+            return "circle.hexagongrid.fill"
+        case .doge:
+            return "pawprint.circle.fill"
+        }
+    }
+
+    /// 菜单标题（带勾选标记）
+    /// - Parameter isCurrent: 是否为当前选中币种
+    /// - Returns: 菜单展示文本
+    func menuTitle(isCurrent: Bool) -> String {
+        return isCurrent ? "✓ \(pairDisplayName)" : "  \(pairDisplayName)"
+    }
+
+    /// 判断是否为当前选中的币种
+    /// - Parameter currentSymbol: 当前选中的币种字符串
+    /// - Returns: 是否为当前选中币种
+    func isCurrentSymbol(_ currentSymbol: String) -> Bool {
+        return rawValue == currentSymbol || displayName.uppercased() == currentSymbol.uppercased()
+    }
+}
+
+// MARK: - Default Crypto Symbol Extensions
+
+extension CryptoSymbol {
+    /// 获取所有默认币种的API符号列表
+    static var allApiSymbols: [String] {
+        return allCases.map { $0.apiSymbol }
+    }
+
+    /// 根据API符号查找对应的默认币种
+    /// - Parameter apiSymbol: API符号
+    /// - Returns: 对应的币种，如果不存在则返回nil
+    static func fromApiSymbol(_ apiSymbol: String) -> CryptoSymbol? {
+        return allCases.first { $0.apiSymbol == apiSymbol }
+    }
+
+    /// 根据显示名称查找对应的默认币种
+    /// - Parameter displayName: 显示名称
+    /// - Returns: 对应的币种，如果不存在则返回nil
+    static func fromDisplayName(_ displayName: String) -> CryptoSymbol? {
+        return allCases.first { $0.displayName.uppercased() == displayName.uppercased() }
+    }
+}
