@@ -125,4 +125,4 @@ Crypto-Monitoring/
 
 Crypto Monitoring 由开发者社区维护，目标是提供一个清晰、快速且安全边界明确的 macOS 加密货币监控入口。项目主页：[nunter/Crypto-Monitoring](https://github.com/nunter/Crypto-Monitoring)。
 
-特别感谢原作者 [jiayouzl](https://github.com/jiayouzl) 及其原始项目 [jiayouzl/Crypto-Monitoring](https://github.com/jiayouzl/Crypto-Monitoring) 的开源贡献与基础工作。
+特别感谢原作者 [jiayouzl](https://github.com/jiayouzl) 及其原始项目 [jiayouzl/Bitcoin-Monitoring](https://github.com/jiayouzl/Bitcoin-Monitoring) 的开源贡献与基础工作。
