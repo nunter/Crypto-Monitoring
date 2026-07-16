@@ -85,12 +85,6 @@ struct TradingOrderRequest {
     let leverage: Int?
     /// Close the complete position instead of using a partial-close notional amount.
     let closeAll: Bool
-    /// Optional take-profit trigger price for open/add orders.
-    let takeProfitPrice: Decimal?
-    /// Optional stop-loss trigger price for open/add orders.
-    let stopLossPrice: Decimal?
-
-    var hasProtection: Bool { takeProfitPrice != nil || stopLossPrice != nil }
 }
 
 struct TradingCredentialScope: Hashable {
@@ -117,25 +111,6 @@ struct BinanceOrderResult: Identifiable {
     let executedQuantity: Decimal
     let averagePrice: Decimal?
     let transactionTime: Date
-    /// Number of TP/SL child orders successfully created.
-    let protectionOrderCount: Int
-    /// The entry order succeeded, but one or more requested protection orders failed.
-    let protectionWarning: String?
-
-    func withProtection(count: Int, warning: String? = nil) -> BinanceOrderResult {
-        BinanceOrderResult(
-            orderId: orderId,
-            symbol: symbol,
-            side: side,
-            status: status,
-            requestedQuantity: requestedQuantity,
-            executedQuantity: executedQuantity,
-            averagePrice: averagePrice,
-            transactionTime: transactionTime,
-            protectionOrderCount: count,
-            protectionWarning: warning
-        )
-    }
 }
 
 struct ProtectionOrderResult {
@@ -237,6 +212,61 @@ struct TradeRecord: Identifiable, Codable {
     var sideText: String { isBuyer ? "买入" : "卖出" }
 }
 
+/// A Binance order may be executed by several fills. This record presents the
+/// order-level result while preserving every commission asset used by its fills.
+struct FilledOrderRecord: Identifiable, Codable {
+    let id: String
+    let orderId: Int64
+    let symbol: String
+    let time: Date
+    let isBuyer: Bool
+    let price: Decimal
+    let quantity: Decimal
+    let quoteQuantity: Decimal
+    let commissions: [String: Decimal]
+    let realizedPnL: Decimal?
+    let positionSide: String?
+
+    var sideText: String { isBuyer ? "买入" : "卖出" }
+
+    static func aggregate(_ trades: [TradeRecord]) -> [FilledOrderRecord] {
+        let grouped = Dictionary(grouping: trades) { trade in
+            "\(trade.symbol):\(trade.orderId)"
+        }
+
+        return grouped.compactMap { id, fills in
+            guard let first = fills.first else { return nil }
+
+            let quantity = fills.reduce(Decimal.zero) { $0 + $1.quantity }
+            let quoteQuantity = fills.reduce(Decimal.zero) { $0 + $1.quoteQuantity }
+            var commissions: [String: Decimal] = [:]
+            for fill in fills where !fill.commissionAsset.isEmpty {
+                commissions[fill.commissionAsset, default: 0] += fill.commission
+            }
+            let hasRealizedPnL = fills.contains { $0.realizedPnL != nil }
+
+            return FilledOrderRecord(
+                id: id,
+                orderId: first.orderId,
+                symbol: first.symbol,
+                time: fills.map(\.time).max() ?? first.time,
+                isBuyer: first.isBuyer,
+                price: quantity > 0 ? quoteQuantity / quantity : first.price,
+                quantity: quantity,
+                quoteQuantity: quoteQuantity,
+                commissions: commissions,
+                realizedPnL: hasRealizedPnL
+                    ? fills.compactMap(\.realizedPnL).reduce(Decimal.zero, +)
+                    : nil,
+                positionSide: first.positionSide
+            )
+        }
+        .sorted { lhs, rhs in
+            lhs.time == rhs.time ? lhs.orderId > rhs.orderId : lhs.time > rhs.time
+        }
+    }
+}
+
 struct PendingOrder: Identifiable, Codable {
     let id: String
     let orderId: String
@@ -254,6 +284,13 @@ struct PendingOrder: Identifiable, Codable {
     let closePosition: Bool
     let createdAt: Date
     let updatedAt: Date
+    var orderListId: Int64? = nil
+    var leverage: Int? = nil
+    var estimatedMargin: Decimal? = nil
+    var estimatedCommission: Decimal? = nil
+    var estimatedCommissionAsset: String? = nil
+    var takeProfitPrices: [Decimal] = []
+    var stopLossPrices: [Decimal] = []
 
     var remainingQuantity: Decimal {
         max(originalQuantity - executedQuantity, 0)
@@ -265,7 +302,7 @@ struct PendingOrder: Identifiable, Codable {
 }
 
 struct TradeAnalytics: Codable {
-    let tradeCount: Int
+    let orderCount: Int
     let buyCount: Int
     let sellCount: Int
     let turnover: Decimal
@@ -277,7 +314,7 @@ struct TradeAnalytics: Codable {
     let commissions: [String: Decimal]
 
     static let empty = TradeAnalytics(
-        tradeCount: 0,
+        orderCount: 0,
         buyCount: 0,
         sellCount: 0,
         turnover: 0,
@@ -289,31 +326,33 @@ struct TradeAnalytics: Codable {
         commissions: [:]
     )
 
-    static func calculate(from trades: [TradeRecord]) -> TradeAnalytics {
-        guard !trades.isEmpty else { return .empty }
+    static func calculate(from orders: [FilledOrderRecord]) -> TradeAnalytics {
+        guard !orders.isEmpty else { return .empty }
 
-        let buys = trades.filter(\.isBuyer)
-        let sells = trades.filter { !$0.isBuyer }
+        let buys = orders.filter(\.isBuyer)
+        let sells = orders.filter { !$0.isBuyer }
         let buyQuantity = buys.reduce(Decimal.zero) { $0 + $1.quantity }
         let sellQuantity = sells.reduce(Decimal.zero) { $0 + $1.quantity }
         let buyQuote = buys.reduce(Decimal.zero) { $0 + $1.quoteQuantity }
         let sellQuote = sells.reduce(Decimal.zero) { $0 + $1.quoteQuantity }
-        let closed = trades.compactMap(\.realizedPnL).filter { $0 != 0 }
+        let closed = orders.compactMap(\.realizedPnL).filter { $0 != 0 }
         let wins = closed.filter { $0 > 0 }.count
         var commissions: [String: Decimal] = [:]
-        for trade in trades {
-            commissions[trade.commissionAsset, default: 0] += trade.commission
+        for order in orders {
+            for (asset, amount) in order.commissions {
+                commissions[asset, default: 0] += amount
+            }
         }
 
         return TradeAnalytics(
-            tradeCount: trades.count,
+            orderCount: orders.count,
             buyCount: buys.count,
             sellCount: sells.count,
-            turnover: trades.reduce(Decimal.zero) { $0 + $1.quoteQuantity },
+            turnover: orders.reduce(Decimal.zero) { $0 + $1.quoteQuantity },
             netBaseFlow: buyQuantity - sellQuantity,
             averageBuyPrice: buyQuantity > 0 ? buyQuote / buyQuantity : nil,
             averageSellPrice: sellQuantity > 0 ? sellQuote / sellQuantity : nil,
-            realizedPnL: trades.compactMap(\.realizedPnL).reduce(Decimal.zero, +),
+            realizedPnL: orders.compactMap(\.realizedPnL).reduce(Decimal.zero, +),
             profitableCloseRate: closed.isEmpty ? nil : Double(wins) / Double(closed.count),
             commissions: commissions
         )
@@ -323,7 +362,7 @@ struct TradeAnalytics: Codable {
 struct TradingDashboardData: Codable {
     let account: TradingAccountSnapshot
     let pendingOrders: [PendingOrder]
-    let trades: [TradeRecord]
+    let filledOrders: [FilledOrderRecord]
     let analytics: TradeAnalytics
     let fetchedAt: Date
 }

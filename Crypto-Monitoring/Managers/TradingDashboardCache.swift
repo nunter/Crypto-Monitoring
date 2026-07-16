@@ -19,7 +19,7 @@ final class TradingDashboardCache {
     private let fileManager: FileManager
     private let directoryURL: URL
     private let maximumAge: TimeInterval = 7 * 24 * 60 * 60
-    private let schemaVersion = 1
+    private let schemaVersion = 3
 
     private init(fileManager: FileManager = .default) {
         self.fileManager = fileManager

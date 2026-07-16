@@ -18,6 +18,10 @@ final class BinanceTradingService {
     /// Immediate fallback for a freshly filled spot BUY. Spot FULL responses
     /// usually expose cumulative quote quantity/fills instead of `avgPrice`.
     private var spotOrderAverageCosts: [String: Decimal] = [:]
+    /// User commission endpoints have a relatively high request weight. Rates
+    /// change infrequently, so cache them per credential scope and symbol.
+    private var commissionRateCache: [String: CachedCommissionRates] = [:]
+    private let commissionRateCacheLifetime: TimeInterval = 15 * 60
 
     @MainActor
     init(appSettings: AppSettings, credentialStore: BinanceCredentialStore = .shared) {
@@ -54,6 +58,9 @@ final class BinanceTradingService {
             secretKey: secretKey,
             for: .init(environment: environment, market: market)
         )
+        withStateLock {
+            commissionRateCache.removeAll()
+        }
     }
 
     func deleteCredentials(environment: TradingEnvironment, market: MarketType) throws {
@@ -62,6 +69,9 @@ final class BinanceTradingService {
             throw BinanceTradingError.unsupported("当前凭据来自环境变量，请在启动环境中删除对应变量")
         }
         try credentialStore.delete(for: scope)
+        withStateLock {
+            commissionRateCache.removeAll()
+        }
     }
 
     private static func maskedApiKey(_ apiKey: String) -> String {
@@ -78,9 +88,15 @@ final class BinanceTradingService {
 
     func fetchDashboard(environment: TradingEnvironment, market: MarketType, symbol: String) async throws -> TradingDashboardData {
         let normalizedSymbol = try normalizeSymbol(symbol)
-        let rawAccount = try await fetchAccount(environment: environment, market: market)
+        let accountData = try await fetchAccountData(environment: environment, market: market)
+        let rawAccount = accountData.snapshot
         let trades = try await fetchTrades(environment: environment, market: market, symbol: normalizedSymbol, limit: 1000)
-        let pendingOrders = try await fetchPendingOrders(environment: environment, market: market)
+        let filledOrders = FilledOrderRecord.aggregate(trades)
+        let pendingOrders = try await fetchPendingOrders(
+            environment: environment,
+            market: market,
+            leverageBySymbol: accountData.leverageBySymbol
+        )
         let account: TradingAccountSnapshot
         if market == .spot {
             withStateLock {
@@ -96,8 +112,8 @@ final class BinanceTradingService {
         return TradingDashboardData(
             account: account,
             pendingOrders: pendingOrders,
-            trades: trades.sorted { $0.time > $1.time },
-            analytics: .calculate(from: trades),
+            filledOrders: filledOrders,
+            analytics: .calculate(from: filledOrders),
             fetchedAt: Date()
         )
     }
@@ -146,78 +162,12 @@ final class BinanceTradingService {
         }
     }
 
-    /// Adds TP/SL protection to an existing USDⓈ-M entry order. Binance Spot
-    /// cannot attach OTO/OCO children to an already-open working order without
-    /// canceling and recreating it, so that unsafe replacement is rejected.
-    func addProtection(
-        to order: PendingOrder,
-        takeProfitPrice: Decimal?,
-        stopLossPrice: Decimal?,
-        environment: TradingEnvironment,
-        market: MarketType,
-        liveTradingEnabled: Bool
-    ) async throws -> ProtectionOrderResult {
-        if environment.isLive && !liveTradingEnabled {
-            throw BinanceTradingError.liveTradingDisabled
-        }
-        guard market == .perpetual else {
-            throw BinanceTradingError.unsupported("Binance 不支持为已有现货挂单原地追加 OTO/OCO；请撤单后使用带止盈止损的新限价单")
-        }
-        guard !order.isAlgoOrder,
-              !order.reduceOnly,
-              !order.closePosition,
-              order.remainingQuantity > 0,
-              order.type == "LIMIT" || order.type == "MARKET" else {
-            throw BinanceTradingError.unsupported("只有未完成的普通入场委托可以追加止盈止损")
-        }
-
-        let symbol = try normalizeSymbol(order.symbol)
-        let direction: PositionDirection
-        if order.positionSide == "LONG" {
-            direction = .long
-        } else if order.positionSide == "SHORT" {
-            direction = .short
-        } else {
-            direction = order.side == "BUY" ? .long : .short
-        }
-        let symbolInfo = try await fetchSymbolInfo(
-            environment: environment,
-            market: .perpetual,
-            symbol: symbol
-        )
-        let markPrice = try await fetchMarkPrice(environment: environment, symbol: symbol)
-        var references = [markPrice]
-        if order.price > 0 { references.append(order.price) }
-        let protection = try normalizedProtectionPrices(
-            takeProfitPrice: takeProfitPrice,
-            stopLossPrice: stopLossPrice,
-            market: .perpetual,
-            direction: direction,
-            symbolInfo: symbolInfo,
-            referencePrices: references
-        )
-        guard !protection.isEmpty else {
-            throw BinanceTradingError.invalidProtectionPrice("请至少设置一个止盈或止损价格")
-        }
-        let isHedgeMode = try await fetchHedgeMode(environment: environment)
-        let placement = await placeFuturesProtectionOrders(
-            environment: environment,
-            symbol: symbol,
-            direction: direction,
-            isHedgeMode: isHedgeMode,
-            protection: protection
-        )
-        guard placement.createdCount > 0 else {
-            throw BinanceTradingError.unsupported(placement.warning ?? "止盈止损保护单添加失败")
-        }
-        return placement
-    }
-
-    /// Adds TP/SL protection directly to an existing USDⓈ-M position. This is
-    /// the path used after an entry order has already filled and disappeared
-    /// from the open-order list.
-    func addProtection(
+    /// Replaces TP/SL protection on an existing USDⓈ-M position. A replacement
+    /// is created before the matching old order is cancelled, so a placement
+    /// failure leaves the previous protection intact.
+    func replaceProtection(
         to position: FuturesPosition,
+        replacing existingOrders: [PendingOrder],
         takeProfitPrice: Decimal?,
         stopLossPrice: Decimal?,
         environment: TradingEnvironment,
@@ -228,7 +178,7 @@ final class BinanceTradingService {
             throw BinanceTradingError.liveTradingDisabled
         }
         guard market == .perpetual, position.amount != 0 else {
-            throw BinanceTradingError.unsupported("只有当前有效的永续合约持仓可以添加止盈止损")
+            throw BinanceTradingError.unsupported("只有当前有效的永续合约持仓可以设置止盈止损")
         }
 
         let symbol = try normalizeSymbol(position.symbol)
@@ -261,17 +211,53 @@ final class BinanceTradingService {
         }
 
         let isHedgeMode = try await fetchHedgeMode(environment: environment)
-        let placement = await placeFuturesProtectionOrders(
+        let takeProfitUpdate = await replaceFuturesProtectionOrder(
+            kind: .takeProfit,
+            newPrice: protection.takeProfit,
+            oldOrders: existingOrders.filter { protectionKind(for: $0.type) == .takeProfit },
             environment: environment,
             symbol: symbol,
             direction: direction,
-            isHedgeMode: isHedgeMode,
-            protection: protection
+            isHedgeMode: isHedgeMode
         )
-        guard placement.createdCount > 0 else {
-            throw BinanceTradingError.unsupported(placement.warning ?? "止盈止损保护单添加失败")
+        let stopLossUpdate = await replaceFuturesProtectionOrder(
+            kind: .stopLoss,
+            newPrice: protection.stopLoss,
+            oldOrders: existingOrders.filter { protectionKind(for: $0.type) == .stopLoss },
+            environment: environment,
+            symbol: symbol,
+            direction: direction,
+            isHedgeMode: isHedgeMode
+        )
+        let createdCount = takeProfitUpdate.createdCount + stopLossUpdate.createdCount
+        var failures = takeProfitUpdate.failures + stopLossUpdate.failures
+        guard createdCount > 0 else {
+            throw BinanceTradingError.unsupported(failures.joined(separator: "；"))
         }
-        return placement
+        if createdCount == protection.count {
+            let disabledOldOrders = existingOrders.filter { order in
+                switch protectionKind(for: order.type) {
+                case .takeProfit: return protection.takeProfit == nil
+                case .stopLoss: return protection.stopLoss == nil
+                case nil: return false
+                }
+            }
+            for oldOrder in disabledOldOrders {
+                do {
+                    try await cancelPendingOrder(
+                        oldOrder,
+                        environment: environment,
+                        market: .perpetual
+                    )
+                } catch {
+                    failures.append("已关闭的旧保护单 #\(oldOrder.orderId) 撤销失败：\(error.localizedDescription)")
+                }
+            }
+        }
+        return ProtectionOrderResult(
+            createdCount: createdCount,
+            warning: failures.isEmpty ? nil : failures.joined(separator: "；")
+        )
     }
 
     /// Protects an already-owned Spot balance with an OCO or a single
@@ -443,42 +429,6 @@ final class BinanceTradingService {
             }
         }
 
-        let protection: ProtectionPrices
-        if isBuy && request.hasProtection {
-            let referencePrice: Decimal
-            if request.orderType == .limit {
-                referencePrice = decimal(parameters["price"])
-            } else {
-                referencePrice = try await fetchSpotPrice(environment: environment, symbol: symbol)
-            }
-            protection = try normalizedProtectionPrices(
-                takeProfitPrice: request.takeProfitPrice,
-                stopLossPrice: request.stopLossPrice,
-                market: request.market,
-                direction: request.direction,
-                symbolInfo: symbolInfo,
-                referencePrices: [referencePrice]
-            )
-        } else {
-            protection = .empty
-        }
-
-        // Spot LIMIT entry + protection is submitted atomically. OTO/OTOCO
-        // keeps the protective SELL order(s) pending until the BUY fills.
-        if request.orderType == .limit, !protection.isEmpty {
-            guard let quantityText = parameters["quantity"],
-                  let priceText = parameters["price"] else {
-                throw BinanceTradingError.invalidResponse
-            }
-            return try await placeProtectedSpotLimitOrder(
-                environment: environment,
-                symbol: symbol,
-                quantity: decimal(quantityText),
-                entryPrice: decimal(priceText),
-                protection: protection
-            )
-        }
-
         let data = try await signedRequest(
             environment: environment,
             market: .spot,
@@ -496,78 +446,7 @@ final class BinanceTradingService {
                 spotOrderAverageCosts[spotCostKey(environment: environment, symbol: symbol)] = averagePrice
             }
         }
-        guard !protection.isEmpty else { return result }
-
-        do {
-            let protectionCount = try await placeSpotProtectionAfterFill(
-                environment: environment,
-                symbol: symbol,
-                symbolInfo: symbolInfo,
-                executedQuantity: result.executedQuantity,
-                protection: protection
-            )
-            return result.withProtection(count: protectionCount)
-        } catch {
-            return result.withProtection(
-                count: 0,
-                warning: "现货止盈/止损保护单添加失败：\(error.localizedDescription)"
-            )
-        }
-    }
-
-    private func placeProtectedSpotLimitOrder(
-        environment: TradingEnvironment,
-        symbol: String,
-        quantity: Decimal,
-        entryPrice: Decimal,
-        protection: ProtectionPrices
-    ) async throws -> BinanceOrderResult {
-        var parameters: [String: String] = [
-            "symbol": symbol,
-            "workingType": "LIMIT",
-            "workingSide": "BUY",
-            "workingPrice": entryPrice.plainString,
-            "workingQuantity": quantity.plainString,
-            "workingTimeInForce": "GTC",
-            "pendingSide": "SELL",
-            "pendingQuantity": quantity.plainString,
-            "newOrderRespType": "FULL"
-        ]
-        let path: String
-
-        if let takeProfit = protection.takeProfit, let stopLoss = protection.stopLoss {
-            path = "/api/v3/orderList/otoco"
-            parameters["pendingAboveType"] = "TAKE_PROFIT"
-            parameters["pendingAboveStopPrice"] = takeProfit.plainString
-            parameters["pendingBelowType"] = "STOP_LOSS"
-            parameters["pendingBelowStopPrice"] = stopLoss.plainString
-        } else {
-            path = "/api/v3/orderList/oto"
-            if let takeProfit = protection.takeProfit {
-                parameters["pendingType"] = "TAKE_PROFIT"
-                parameters["pendingStopPrice"] = takeProfit.plainString
-            } else if let stopLoss = protection.stopLoss {
-                parameters["pendingType"] = "STOP_LOSS"
-                parameters["pendingStopPrice"] = stopLoss.plainString
-            } else {
-                throw BinanceTradingError.invalidProtectionPrice("请至少设置一个止盈或止损价格")
-            }
-        }
-
-        let data = try await signedRequest(
-            environment: environment,
-            market: .spot,
-            method: "POST",
-            path: path,
-            parameters: &parameters
-        )
-        let response = try decode(SpotOrderListResponseDTO.self, from: data)
-        guard let workingOrder = response.orderReports.first(where: { $0.side == "BUY" }) else {
-            throw BinanceTradingError.invalidResponse
-        }
-        return workingOrder
-            .result(fallbackQuantity: quantity)
-            .withProtection(count: protection.count)
+        return result
     }
 
     private func placeSpotProtectionAfterFill(
@@ -655,7 +534,7 @@ final class BinanceTradingService {
         ]
 
         let currentMarkPrice: Decimal?
-        if request.hasProtection || (request.orderType == .market && request.sizingMode == .amount && !(request.action == .close && request.closeAll)) {
+        if request.orderType == .market && request.sizingMode == .amount && !(request.action == .close && request.closeAll) {
             currentMarkPrice = try await fetchMarkPrice(environment: environment, symbol: symbol)
         } else {
             currentMarkPrice = nil
@@ -670,33 +549,11 @@ final class BinanceTradingService {
             referencePrice = finalPrice
         } else if request.sizingMode == .amount && !(request.action == .close && request.closeAll) {
             referencePrice = currentMarkPrice ?? 0
-        } else if let currentMarkPrice {
-            // Quantity-sized market entries still need a real reference when
-            // validating optional TP/SL trigger direction.
-            referencePrice = currentMarkPrice
         } else {
             // Direct-quantity market orders and full closes do not need a price conversion.
             referencePrice = 1
         }
         guard referencePrice > 0 else { throw BinanceTradingError.invalidResponse }
-
-        let protection: ProtectionPrices
-        if !request.action.isReducing && request.hasProtection {
-            var references = [referencePrice]
-            if let currentMarkPrice, !references.contains(currentMarkPrice) {
-                references.append(currentMarkPrice)
-            }
-            protection = try normalizedProtectionPrices(
-                takeProfitPrice: request.takeProfitPrice,
-                stopLossPrice: request.stopLossPrice,
-                market: request.market,
-                direction: request.direction,
-                symbolInfo: symbolInfo,
-                referencePrices: references
-            )
-        } else {
-            protection = .empty
-        }
 
         if request.action.isReducing {
             let account = try await fetchFuturesAccountDTO(environment: environment)
@@ -767,65 +624,49 @@ final class BinanceTradingService {
             parameters: &parameters
         )
         let response = try decode(OrderResponseDTO.self, from: data)
-        let result = response.result(fallbackQuantity: finalQuantity)
-        guard !protection.isEmpty else { return result }
-
-        let placement = await placeFuturesProtectionOrders(
-            environment: environment,
-            symbol: symbol,
-            direction: request.direction,
-            isHedgeMode: isHedgeMode,
-            protection: protection
-        )
-        return result.withProtection(
-            count: placement.createdCount,
-            warning: placement.warning
-        )
+        return response.result(fallbackQuantity: finalQuantity)
     }
 
-    private func placeFuturesProtectionOrders(
+    private func replaceFuturesProtectionOrder(
+        kind: ProtectionKind,
+        newPrice: Decimal?,
+        oldOrders: [PendingOrder],
         environment: TradingEnvironment,
         symbol: String,
         direction: PositionDirection,
-        isHedgeMode: Bool,
-        protection: ProtectionPrices
-    ) async -> ProtectionOrderResult {
-        var protectionCount = 0
+        isHedgeMode: Bool
+    ) async -> (createdCount: Int, failures: [String]) {
+        let label = kind == .takeProfit ? "止盈" : "止损"
+        var createdCount = 0
         var failures: [String] = []
-        if let takeProfit = protection.takeProfit {
+
+        guard let newPrice else { return (0, []) }
+        do {
+            try await placeFuturesProtectionOrder(
+                environment: environment,
+                symbol: symbol,
+                direction: direction,
+                isHedgeMode: isHedgeMode,
+                type: kind == .takeProfit ? "TAKE_PROFIT_MARKET" : "STOP_MARKET",
+                triggerPrice: newPrice
+            )
+            createdCount = 1
+        } catch {
+            return (0, ["\(label)更新失败：\(error.localizedDescription)"])
+        }
+
+        for oldOrder in oldOrders {
             do {
-                try await placeFuturesProtectionOrder(
+                try await cancelPendingOrder(
+                    oldOrder,
                     environment: environment,
-                    symbol: symbol,
-                    direction: direction,
-                    isHedgeMode: isHedgeMode,
-                    type: "TAKE_PROFIT_MARKET",
-                    triggerPrice: takeProfit
+                    market: .perpetual
                 )
-                protectionCount += 1
             } catch {
-                failures.append("止盈单失败：\(error.localizedDescription)")
+                failures.append("旧\(label)单 #\(oldOrder.orderId) 撤销失败：\(error.localizedDescription)")
             }
         }
-        if let stopLoss = protection.stopLoss {
-            do {
-                try await placeFuturesProtectionOrder(
-                    environment: environment,
-                    symbol: symbol,
-                    direction: direction,
-                    isHedgeMode: isHedgeMode,
-                    type: "STOP_MARKET",
-                    triggerPrice: stopLoss
-                )
-                protectionCount += 1
-            } catch {
-                failures.append("止损单失败：\(error.localizedDescription)")
-            }
-        }
-        return ProtectionOrderResult(
-            createdCount: protectionCount,
-            warning: failures.isEmpty ? nil : failures.joined(separator: "；")
-        )
+        return (createdCount, failures)
     }
 
     private func placeFuturesProtectionOrder(
@@ -904,49 +745,67 @@ final class BinanceTradingService {
     // MARK: - Account and trade data
 
     private func fetchAccount(environment: TradingEnvironment, market: MarketType) async throws -> TradingAccountSnapshot {
+        try await fetchAccountData(environment: environment, market: market).snapshot
+    }
+
+    private func fetchAccountData(
+        environment: TradingEnvironment,
+        market: MarketType
+    ) async throws -> AccountData {
         switch market {
         case .spot:
             let dto = try await fetchSpotAccountDTO(environment: environment)
-            return TradingAccountSnapshot(
-                canTrade: dto.canTrade,
-                spotBalances: dto.balances.map {
-                    TradingBalance(asset: $0.asset, free: decimal($0.free), locked: decimal($0.locked))
-                }.filter { $0.total != 0 }.sorted { $0.asset < $1.asset },
-                spotPositions: [],
-                futuresWalletBalance: 0,
-                futuresAvailableBalance: 0,
-                futuresUnrealizedPnL: 0,
-                futuresPositions: []
+            return AccountData(
+                snapshot: TradingAccountSnapshot(
+                    canTrade: dto.canTrade,
+                    spotBalances: dto.balances.map {
+                        TradingBalance(asset: $0.asset, free: decimal($0.free), locked: decimal($0.locked))
+                    }.filter { $0.total != 0 }.sorted { $0.asset < $1.asset },
+                    spotPositions: [],
+                    futuresWalletBalance: 0,
+                    futuresAvailableBalance: 0,
+                    futuresUnrealizedPnL: 0,
+                    futuresPositions: []
+                ),
+                leverageBySymbol: [:]
             )
         case .perpetual:
             let dto = try await fetchFuturesAccountDTO(environment: environment)
             let positionRisks = try await fetchFuturesPositionRisks(environment: environment)
-            return TradingAccountSnapshot(
-                canTrade: dto.canTrade,
-                spotBalances: [],
-                spotPositions: [],
-                futuresWalletBalance: decimal(dto.totalWalletBalance),
-                futuresAvailableBalance: decimal(dto.availableBalance),
-                futuresUnrealizedPnL: decimal(dto.totalUnrealizedProfit),
-                futuresPositions: positionRisks.map { risk in
-                    let accountPosition = dto.positions.first {
-                        $0.symbol == risk.symbol && $0.positionSide == risk.positionSide
-                    }
-                    return FuturesPosition(
-                        symbol: risk.symbol,
-                        positionSide: risk.positionSide,
-                        amount: decimal(risk.positionAmt),
-                        entryPrice: decimal(risk.entryPrice),
-                        markPrice: decimal(risk.markPrice),
-                        notionalValue: decimal(risk.notional),
-                        initialMargin: decimal(risk.initialMargin),
-                        unrealizedPnL: decimal(risk.unRealizedProfit),
-                        liquidationPrice: decimal(risk.liquidationPrice),
-                        marginAsset: risk.marginAsset,
-                        leverage: Int(accountPosition?.leverage ?? "0") ?? 0,
-                        isolated: accountPosition?.isolated ?? false
-                    )
-                }.filter { $0.amount != 0 }
+            let leverageBySymbol = dto.positions.reduce(into: [String: Int]()) { result, position in
+                if let leverage = Int(position.leverage), leverage > 0 {
+                    result[position.symbol] = leverage
+                }
+            }
+            return AccountData(
+                snapshot: TradingAccountSnapshot(
+                    canTrade: dto.canTrade,
+                    spotBalances: [],
+                    spotPositions: [],
+                    futuresWalletBalance: decimal(dto.totalWalletBalance),
+                    futuresAvailableBalance: decimal(dto.availableBalance),
+                    futuresUnrealizedPnL: decimal(dto.totalUnrealizedProfit),
+                    futuresPositions: positionRisks.map { risk in
+                        let accountPosition = dto.positions.first {
+                            $0.symbol == risk.symbol && $0.positionSide == risk.positionSide
+                        }
+                        return FuturesPosition(
+                            symbol: risk.symbol,
+                            positionSide: risk.positionSide,
+                            amount: decimal(risk.positionAmt),
+                            entryPrice: decimal(risk.entryPrice),
+                            markPrice: decimal(risk.markPrice),
+                            notionalValue: decimal(risk.notional),
+                            initialMargin: decimal(risk.initialMargin),
+                            unrealizedPnL: decimal(risk.unRealizedProfit),
+                            liquidationPrice: decimal(risk.liquidationPrice),
+                            marginAsset: risk.marginAsset,
+                            leverage: Int(accountPosition?.leverage ?? "0") ?? 0,
+                            isolated: accountPosition?.isolated ?? false
+                        )
+                    }.filter { $0.amount != 0 }
+                ),
+                leverageBySymbol: leverageBySymbol
             )
         }
     }
@@ -1194,7 +1053,8 @@ final class BinanceTradingService {
 
     private func fetchPendingOrders(
         environment: TradingEnvironment,
-        market: MarketType
+        market: MarketType,
+        leverageBySymbol: [String: Int]
     ) async throws -> [PendingOrder] {
         var parameters: [String: String] = [:]
         let path = market == .spot ? "/api/v3/openOrders" : "/fapi/v1/openOrders"
@@ -1208,7 +1068,7 @@ final class BinanceTradingService {
         let regularOrders = try decode([OpenOrderDTO].self, from: data).map { order in
             let createdMilliseconds = order.time ?? order.updateTime ?? 0
             let updatedMilliseconds = order.updateTime ?? order.time ?? 0
-            return PendingOrder(
+            var pendingOrder = PendingOrder(
                 id: "regular-\(order.symbol)-\(order.orderId)",
                 orderId: String(order.orderId),
                 symbol: order.symbol,
@@ -1226,10 +1086,17 @@ final class BinanceTradingService {
                 createdAt: date(milliseconds: createdMilliseconds),
                 updatedAt: date(milliseconds: updatedMilliseconds)
             )
+            pendingOrder.orderListId = order.orderListId
+            return pendingOrder
         }
 
         guard market == .perpetual else {
-            return regularOrders.sorted { $0.updatedAt > $1.updatedAt }
+            return await enrichPendingOrders(
+                regularOrders,
+                environment: environment,
+                market: market,
+                leverageBySymbol: leverageBySymbol
+            )
         }
 
         // USDⓈ-M 新版接口将止盈止损、条件单和追踪委托单独归入 Algo Orders。
@@ -1243,33 +1110,278 @@ final class BinanceTradingService {
                 path: "/fapi/v1/openAlgoOrders",
                 parameters: &algoParameters
             )
-            let algoOrders = try decode([FuturesAlgoOpenOrderDTO].self, from: algoData).map { order in
-                PendingOrder(
-                    id: "algo-\(order.symbol)-\(order.algoId)",
-                    orderId: String(order.algoId),
-                    symbol: order.symbol,
-                    side: order.side,
-                    positionSide: order.positionSide,
-                    type: order.orderType,
-                    status: order.algoStatus,
-                    timeInForce: order.timeInForce,
-                    price: decimal(order.price),
-                    triggerPrice: decimal(order.triggerPrice),
-                    originalQuantity: decimal(order.quantity),
-                    executedQuantity: 0,
-                    reduceOnly: order.reduceOnly ?? false,
-                    closePosition: order.closePosition ?? false,
-                    createdAt: date(milliseconds: order.createTime),
-                    updatedAt: date(milliseconds: order.updateTime)
-                )
-            }
-            return (regularOrders + algoOrders).sorted { $0.updatedAt > $1.updatedAt }
+            let algoOrders = try decodeFuturesAlgoPendingOrders(from: algoData)
+            return await enrichPendingOrders(
+                regularOrders + algoOrders,
+                environment: environment,
+                market: market,
+                leverageBySymbol: leverageBySymbol
+            )
         } catch {
             #if DEBUG
-            print("⚠️ [BinanceTradingService] 合约条件委托拉取失败，仅展示普通委托: \(error.localizedDescription)")
+            print("⚠️ [BinanceTradingService] 开放 Algo 委托拉取失败，尝试历史接口回填: \(error.localizedDescription)")
             #endif
-            return regularOrders.sorted { $0.updatedAt > $1.updatedAt }
+            let fallbackAlgoOrders = await fetchActiveAlgoOrderFallback(
+                environment: environment,
+                market: market,
+                symbols: Set(regularOrders.map(\.symbol))
+            )
+            return await enrichPendingOrders(
+                regularOrders + fallbackAlgoOrders,
+                environment: environment,
+                market: market,
+                leverageBySymbol: leverageBySymbol
+            )
         }
+    }
+
+    private func fetchActiveAlgoOrderFallback(
+        environment: TradingEnvironment,
+        market: MarketType,
+        symbols: Set<String>
+    ) async -> [PendingOrder] {
+        var result: [PendingOrder] = []
+        for symbol in symbols {
+            var parameters = ["symbol": symbol, "limit": "100"]
+            guard let data = try? await signedRequest(
+                environment: environment,
+                market: market,
+                method: "GET",
+                path: "/fapi/v1/allAlgoOrders",
+                parameters: &parameters
+            ), let orders = try? decodeFuturesAlgoPendingOrders(from: data) else {
+                continue
+            }
+            result.append(contentsOf: orders.filter { isActiveAlgoStatus($0.status) })
+        }
+        return result.reduce(into: [PendingOrder]()) { unique, order in
+            if !unique.contains(where: { $0.id == order.id }) { unique.append(order) }
+        }
+    }
+
+    private func decodeFuturesAlgoPendingOrders(from data: Data) throws -> [PendingOrder] {
+        try decode([FuturesAlgoOpenOrderDTO].self, from: data).compactMap { order in
+            guard let algoId = order.algoId,
+                  algoId > 0,
+                  let orderType = order.orderType,
+                  let symbol = order.symbol,
+                  !symbol.isEmpty,
+                  let side = order.side,
+                  !side.isEmpty else {
+                #if DEBUG
+                print("⚠️ [BinanceTradingService] 忽略字段不完整的合约 Algo 委托")
+                #endif
+                return nil
+            }
+            return PendingOrder(
+                id: "algo-\(symbol)-\(algoId)",
+                orderId: String(algoId),
+                symbol: symbol,
+                side: side,
+                positionSide: order.positionSide,
+                type: orderType,
+                status: order.algoStatus ?? "NEW",
+                timeInForce: order.timeInForce,
+                price: decimal(order.price),
+                triggerPrice: decimal(order.triggerPrice),
+                originalQuantity: decimal(order.quantity),
+                executedQuantity: 0,
+                reduceOnly: order.reduceOnly ?? false,
+                closePosition: order.closePosition ?? false,
+                createdAt: date(milliseconds: order.createTime ?? order.updateTime ?? 0),
+                updatedAt: date(milliseconds: order.updateTime ?? order.createTime ?? 0)
+            )
+        }
+    }
+
+    private func isActiveAlgoStatus(_ status: String) -> Bool {
+        ["NEW", "PENDING_NEW", "PARTIALLY_FILLED"].contains(status.uppercased())
+    }
+
+    private func enrichPendingOrders(
+        _ pendingOrders: [PendingOrder],
+        environment: TradingEnvironment,
+        market: MarketType,
+        leverageBySymbol: [String: Int]
+    ) async -> [PendingOrder] {
+        let symbols = Set(pendingOrders.map(\.symbol))
+        var ratesBySymbol: [String: OrderCommissionRates] = [:]
+        for symbol in symbols {
+            if let rates = try? await commissionRates(
+                environment: environment,
+                market: market,
+                symbol: symbol
+            ) {
+                ratesBySymbol[symbol] = rates
+            }
+        }
+
+        var enriched = pendingOrders.map { order -> PendingOrder in
+            var order = order
+            let protectionPrice = order.triggerPrice > 0 ? order.triggerPrice : order.price
+            if protectionPrice > 0 {
+                switch protectionKind(for: order.type) {
+                case .takeProfit:
+                    order.takeProfitPrices = [protectionPrice]
+                case .stopLoss:
+                    order.stopLossPrices = [protectionPrice]
+                case nil:
+                    break
+                }
+            }
+
+            if market == .perpetual {
+                order.leverage = leverageBySymbol[order.symbol]
+            }
+
+            let valuationPrice = order.price > 0 ? order.price : order.triggerPrice
+            let remainingNotional = valuationPrice > 0 && order.remainingQuantity > 0
+                ? valuationPrice * order.remainingQuantity
+                : 0
+            if remainingNotional > 0,
+               let rates = ratesBySymbol[order.symbol] {
+                let isMakerEstimate = (order.type == "LIMIT" || order.type == "LIMIT_MAKER")
+                    && order.triggerPrice == 0
+                let rate = rates.rate(isMaker: isMakerEstimate, isBuyer: order.side == "BUY")
+                if rate > 0 {
+                    order.estimatedCommission = remainingNotional * rate
+                    order.estimatedCommissionAsset = order.symbol.hasSuffix("USDT") ? "USDT" : nil
+                }
+            }
+
+            if market == .perpetual,
+               !isProtectionCandidate(order, market: market),
+               !order.reduceOnly,
+               !order.closePosition,
+               let leverage = order.leverage,
+               leverage > 0,
+               remainingNotional > 0 {
+                order.estimatedMargin = remainingNotional / Decimal(leverage)
+            }
+            return order
+        }
+
+        let protections = enriched.filter { isProtectionCandidate($0, market: market) }
+        enriched = enriched.map { order -> PendingOrder in
+            guard !isProtectionCandidate(order, market: market) else { return order }
+
+            let matches: [PendingOrder]
+            switch market {
+            case .spot:
+                guard let orderListId = order.orderListId, orderListId >= 0 else { return order }
+                matches = protections.filter { $0.orderListId == orderListId }
+            case .perpetual:
+                let direction = pendingOrderDirection(order, isProtection: false)
+                matches = protections.filter {
+                    $0.symbol == order.symbol
+                        && pendingOrderDirection($0, isProtection: true) == direction
+                }
+            }
+
+            var order = order
+            order.takeProfitPrices = uniqueSortedPrices(
+                order.takeProfitPrices
+                    + matches.flatMap(\.takeProfitPrices)
+            )
+            order.stopLossPrices = uniqueSortedPrices(
+                order.stopLossPrices
+                    + matches.flatMap(\.stopLossPrices)
+            )
+            return order
+        }
+
+        return enriched.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func commissionRates(
+        environment: TradingEnvironment,
+        market: MarketType,
+        symbol: String
+    ) async throws -> OrderCommissionRates {
+        let cacheKey = "\(environment.rawValue):\(market.rawValue):\(symbol)"
+        let now = Date()
+        if let cached = withStateLock({ commissionRateCache[cacheKey] }),
+           now.timeIntervalSince(cached.fetchedAt) < commissionRateCacheLifetime {
+            guard let rates = cached.rates else { throw BinanceTradingError.invalidResponse }
+            return rates
+        }
+
+        do {
+            var parameters = ["symbol": symbol]
+            let path = market == .spot ? "/api/v3/account/commission" : "/fapi/v1/commissionRate"
+            let data = try await signedRequest(
+                environment: environment,
+                market: market,
+                method: "GET",
+                path: path,
+                parameters: &parameters
+            )
+            let rates: OrderCommissionRates
+            switch market {
+            case .spot:
+                let dto = try decode(SpotCommissionRateDTO.self, from: data)
+                rates = OrderCommissionRates(
+                    makerBuyer: dto.totalRate(isMaker: true, isBuyer: true, decimal: decimal),
+                    makerSeller: dto.totalRate(isMaker: true, isBuyer: false, decimal: decimal),
+                    takerBuyer: dto.totalRate(isMaker: false, isBuyer: true, decimal: decimal),
+                    takerSeller: dto.totalRate(isMaker: false, isBuyer: false, decimal: decimal)
+                )
+            case .perpetual:
+                let dto = try decode(FuturesCommissionRateDTO.self, from: data)
+                let maker = decimal(dto.makerCommissionRate)
+                let taker = decimal(dto.takerCommissionRate)
+                rates = OrderCommissionRates(
+                    makerBuyer: maker,
+                    makerSeller: maker,
+                    takerBuyer: taker,
+                    takerSeller: taker
+                )
+            }
+            withStateLock {
+                commissionRateCache[cacheKey] = CachedCommissionRates(rates: rates, fetchedAt: now)
+            }
+            return rates
+        } catch {
+            // Cache unsupported/testnet failures too; otherwise the 10-second
+            // dashboard refresh would repeatedly hit this weight-20 endpoint.
+            withStateLock {
+                commissionRateCache[cacheKey] = CachedCommissionRates(rates: nil, fetchedAt: now)
+            }
+            throw error
+        }
+    }
+
+    private func isProtectionCandidate(_ order: PendingOrder, market: MarketType) -> Bool {
+        guard protectionKind(for: order.type) != nil else { return false }
+        switch market {
+        case .spot:
+            return order.side == "SELL"
+        case .perpetual:
+            return order.reduceOnly || order.closePosition
+        }
+    }
+
+    private func protectionKind(for type: String) -> ProtectionKind? {
+        if type.contains("TAKE_PROFIT") { return .takeProfit }
+        if type.contains("STOP") { return .stopLoss }
+        return nil
+    }
+
+    private func pendingOrderDirection(_ order: PendingOrder, isProtection: Bool) -> String {
+        if order.positionSide == "LONG" || order.positionSide == "SHORT" {
+            return order.positionSide ?? ""
+        }
+        if isProtection {
+            return order.side == "SELL" ? "LONG" : "SHORT"
+        }
+        return order.side == "BUY" ? "LONG" : "SHORT"
+    }
+
+    private func uniqueSortedPrices(_ prices: [Decimal]) -> [Decimal] {
+        prices.reduce(into: [Decimal]()) { result, price in
+            if price > 0, !result.contains(price) { result.append(price) }
+        }
+        .sorted()
     }
 
     private func fetchHedgeMode(environment: TradingEnvironment) async throws -> Bool {
@@ -1555,6 +1667,37 @@ final class BinanceTradingService {
     }
 }
 
+private struct AccountData {
+    let snapshot: TradingAccountSnapshot
+    let leverageBySymbol: [String: Int]
+}
+
+private struct OrderCommissionRates {
+    let makerBuyer: Decimal
+    let makerSeller: Decimal
+    let takerBuyer: Decimal
+    let takerSeller: Decimal
+
+    func rate(isMaker: Bool, isBuyer: Bool) -> Decimal {
+        switch (isMaker, isBuyer) {
+        case (true, true): return makerBuyer
+        case (true, false): return makerSeller
+        case (false, true): return takerBuyer
+        case (false, false): return takerSeller
+        }
+    }
+}
+
+private struct CachedCommissionRates {
+    let rates: OrderCommissionRates?
+    let fetchedAt: Date
+}
+
+private enum ProtectionKind {
+    case takeProfit
+    case stopLoss
+}
+
 // MARK: - Binance REST DTOs
 
 private struct APIErrorDTO: Decodable { let code: Int; let msg: String }
@@ -1569,6 +1712,42 @@ private struct SpotTickerPriceDTO: Decodable {
 private struct SpotAccountDTO: Decodable {
     let canTrade: Bool
     let balances: [SpotBalanceDTO]
+}
+
+private struct SpotCommissionComponentDTO: Decodable {
+    let maker: String
+    let taker: String
+    let buyer: String
+    let seller: String
+
+    func rate(
+        isMaker: Bool,
+        isBuyer: Bool,
+        decimal: (String?) -> Decimal
+    ) -> Decimal {
+        decimal(isMaker ? maker : taker) + decimal(isBuyer ? buyer : seller)
+    }
+}
+
+private struct SpotCommissionRateDTO: Decodable {
+    let standardCommission: SpotCommissionComponentDTO
+    let specialCommission: SpotCommissionComponentDTO
+    let taxCommission: SpotCommissionComponentDTO
+
+    func totalRate(
+        isMaker: Bool,
+        isBuyer: Bool,
+        decimal: (String?) -> Decimal
+    ) -> Decimal {
+        standardCommission.rate(isMaker: isMaker, isBuyer: isBuyer, decimal: decimal)
+            + specialCommission.rate(isMaker: isMaker, isBuyer: isBuyer, decimal: decimal)
+            + taxCommission.rate(isMaker: isMaker, isBuyer: isBuyer, decimal: decimal)
+    }
+}
+
+private struct FuturesCommissionRateDTO: Decodable {
+    let makerCommissionRate: String
+    let takerCommissionRate: String
 }
 
 private struct SpotBalanceDTO: Decodable {
@@ -1641,23 +1820,94 @@ private struct OpenOrderDTO: Decodable {
     let positionSide: String?
     let reduceOnly: Bool?
     let closePosition: Bool?
+    let orderListId: Int64?
 }
 
 private struct FuturesAlgoOpenOrderDTO: Decodable {
-    let algoId: Int64
-    let orderType: String
-    let symbol: String
-    let side: String
+    let algoId: Int64?
+    let orderType: String?
+    let symbol: String?
+    let side: String?
     let positionSide: String?
     let timeInForce: String?
-    let quantity: String
-    let algoStatus: String
+    let quantity: String?
+    let algoStatus: String?
     let triggerPrice: String?
     let price: String?
     let reduceOnly: Bool?
     let closePosition: Bool?
-    let createTime: Int64
-    let updateTime: Int64
+    let createTime: Int64?
+    let updateTime: Int64?
+
+    private enum CodingKeys: String, CodingKey {
+        case algoId
+        case orderType
+        case symbol
+        case side
+        case positionSide
+        case timeInForce
+        case quantity
+        case algoStatus
+        case triggerPrice
+        case price
+        case reduceOnly
+        case closePosition
+        case createTime
+        case updateTime
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        algoId = container.flexibleInt64(forKey: .algoId)
+        orderType = container.flexibleString(forKey: .orderType)
+        symbol = container.flexibleString(forKey: .symbol)
+        side = container.flexibleString(forKey: .side)
+        positionSide = container.flexibleString(forKey: .positionSide)
+        timeInForce = container.flexibleString(forKey: .timeInForce)
+        // Close-all TP/SL orders cannot carry quantity. Different Binance
+        // environments have returned this as an omitted value, a string, or
+        // a numeric zero, so decode it losslessly instead of failing the array.
+        quantity = container.flexibleString(forKey: .quantity)
+        algoStatus = container.flexibleString(forKey: .algoStatus)
+        triggerPrice = container.flexibleString(forKey: .triggerPrice)
+        price = container.flexibleString(forKey: .price)
+        reduceOnly = container.flexibleBool(forKey: .reduceOnly)
+        closePosition = container.flexibleBool(forKey: .closePosition)
+        createTime = container.flexibleInt64(forKey: .createTime)
+        updateTime = container.flexibleInt64(forKey: .updateTime)
+    }
+}
+
+private extension KeyedDecodingContainer {
+    func flexibleString(forKey key: Key) -> String? {
+        if let value = try? decode(String.self, forKey: key) { return value }
+        if let value = try? decode(Decimal.self, forKey: key) {
+            return NSDecimalNumber(decimal: value).stringValue
+        }
+        if let value = try? decode(Bool.self, forKey: key) {
+            return value ? "true" : "false"
+        }
+        return nil
+    }
+
+    func flexibleInt64(forKey key: Key) -> Int64? {
+        if let value = try? decode(Int64.self, forKey: key) { return value }
+        if let value = try? decode(String.self, forKey: key) { return Int64(value) }
+        return nil
+    }
+
+    func flexibleBool(forKey key: Key) -> Bool? {
+        if let value = try? decode(Bool.self, forKey: key) { return value }
+        if let value = try? decode(String.self, forKey: key) {
+            switch value.lowercased() {
+            case "true", "1": return true
+            case "false", "0": return false
+            default: return nil
+            }
+        }
+        if let value = try? decode(Int.self, forKey: key) { return value != 0 }
+        return nil
+    }
 }
 
 private struct ExchangeInfoDTO: Decodable { let symbols: [ExchangeSymbolDTO] }
@@ -1730,9 +1980,7 @@ private struct OrderResponseDTO: Decodable {
             requestedQuantity: original,
             executedQuantity: executed,
             averagePrice: price,
-            transactionTime: Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000),
-            protectionOrderCount: 0,
-            protectionWarning: nil
+            transactionTime: Date(timeIntervalSince1970: TimeInterval(milliseconds) / 1000)
         )
     }
 }

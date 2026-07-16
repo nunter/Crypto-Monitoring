@@ -228,7 +228,7 @@ final class TradingManager: ObservableObject {
                 #endif
             }
             if showsStatusMessage {
-                statusMessage = "账户、当前委托与最近成交已更新"
+                statusMessage = "账户、当前委托与历史成交订单已更新"
             } else if wasWaitingForInitialDashboard {
                 // 自动刷新从暂时性连接失败中恢复后，移除首次加载错误。
                 errorMessage = nil
@@ -254,11 +254,7 @@ final class TradingManager: ObservableObject {
         closeAll: Bool,
         orderType: TradingOrderType,
         priceText: String,
-        sizingMode: TradingSizingMode,
-        takeProfitEnabled: Bool,
-        takeProfitText: String,
-        stopLossEnabled: Bool,
-        stopLossText: String
+        sizingMode: TradingSizingMode
     ) async {
         let closesCompletePosition = action == .close && closeAll
         let quantity: Decimal?
@@ -310,28 +306,6 @@ final class TradingManager: ObservableObject {
             limitPrice = nil
         }
 
-        let takeProfitPrice: Decimal?
-        if takeProfitEnabled && !action.isReducing {
-            takeProfitPrice = Self.parsePositiveDecimal(takeProfitText)
-            guard takeProfitPrice != nil else {
-                errorMessage = "请输入有效的止盈触发价"
-                return
-            }
-        } else {
-            takeProfitPrice = nil
-        }
-
-        let stopLossPrice: Decimal?
-        if stopLossEnabled && !action.isReducing {
-            stopLossPrice = Self.parsePositiveDecimal(stopLossText)
-            guard stopLossPrice != nil else {
-                errorMessage = "请输入有效的止损触发价"
-                return
-            }
-        } else {
-            stopLossPrice = nil
-        }
-
         isSubmitting = true
         errorMessage = nil
         statusMessage = nil
@@ -349,21 +323,12 @@ final class TradingManager: ObservableObject {
                     quantity: quantity,
                     amount: amount,
                     leverage: market == .perpetual ? leverage : nil,
-                    closeAll: closeAll,
-                    takeProfitPrice: takeProfitPrice,
-                    stopLossPrice: stopLossPrice
+                    closeAll: closeAll
                 ),
                 environment: environment,
                 liveTradingEnabled: appSettings.liveTradingEnabled
             )
-            if let warning = lastOrder?.protectionWarning {
-                errorMessage = "主订单已提交，但\(warning)"
-            } else {
-                let protectionText = (lastOrder?.protectionOrderCount ?? 0) > 0
-                    ? "，并已添加 \(lastOrder?.protectionOrderCount ?? 0) 个止盈/止损保护单"
-                    : ""
-                statusMessage = "\(action.displayName)指令已提交\(protectionText)"
-            }
+            statusMessage = "\(action.displayName)指令已提交"
             await refreshDashboard(showsStatusMessage: false)
         } catch {
             errorMessage = error.localizedDescription
@@ -406,51 +371,9 @@ final class TradingManager: ObservableObject {
         }
     }
 
-    func addProtection(
-        to order: PendingOrder,
-        takeProfitText: String,
-        stopLossText: String
-    ) async -> Bool {
-        guard !addingProtectionOrderIDs.contains(order.id) else { return false }
-        let takeProfit = Self.parsePositiveDecimal(takeProfitText)
-        let stopLoss = Self.parsePositiveDecimal(stopLossText)
-        guard takeProfit != nil || stopLoss != nil else {
-            errorMessage = "请至少输入一个有效的止盈或止损触发价"
-            return false
-        }
-
-        let requestedEnvironment = environment
-        let requestedMarket = market
-        addingProtectionOrderIDs.insert(order.id)
-        errorMessage = nil
-        statusMessage = nil
-        defer { addingProtectionOrderIDs.remove(order.id) }
-
-        do {
-            let result = try await service.addProtection(
-                to: order,
-                takeProfitPrice: takeProfit,
-                stopLossPrice: stopLoss,
-                environment: requestedEnvironment,
-                market: requestedMarket,
-                liveTradingEnabled: appSettings.liveTradingEnabled
-            )
-            guard requestedEnvironment == environment, requestedMarket == market else { return true }
-            if let warning = result.warning {
-                errorMessage = "已添加 \(result.createdCount) 个保护单，但\(warning)"
-            } else {
-                statusMessage = "已为委托 #\(order.orderId) 添加 \(result.createdCount) 个止盈/止损保护单"
-            }
-            await refreshDashboard(showsStatusMessage: false)
-            return true
-        } catch {
-            errorMessage = error.localizedDescription
-            return false
-        }
-    }
-
-    func addProtection(
+    func updateProtection(
         to position: FuturesPosition,
+        replacing existingOrders: [PendingOrder],
         takeProfitText: String,
         stopLossText: String
     ) async -> Bool {
@@ -470,8 +393,9 @@ final class TradingManager: ObservableObject {
         defer { addingProtectionOrderIDs.remove(position.id) }
 
         do {
-            let result = try await service.addProtection(
+            let result = try await service.replaceProtection(
                 to: position,
+                replacing: existingOrders,
                 takeProfitPrice: takeProfit,
                 stopLossPrice: stopLoss,
                 environment: requestedEnvironment,
@@ -480,9 +404,9 @@ final class TradingManager: ObservableObject {
             )
             guard requestedEnvironment == environment, requestedMarket == market else { return true }
             if let warning = result.warning {
-                errorMessage = "已添加 \(result.createdCount) 个保护单，但\(warning)"
+                errorMessage = "持仓保护已部分更新，但\(warning)"
             } else {
-                statusMessage = "已为 \(position.symbol) \(position.directionText)仓添加 \(result.createdCount) 个止盈/止损保护单"
+                statusMessage = "已更新 \(position.symbol) \(position.directionText)仓止盈止损"
             }
             await refreshDashboard(showsStatusMessage: false)
             return true
@@ -585,7 +509,7 @@ final class TradingManager: ObservableObject {
         let updated = TradingDashboardData(
             account: current.account,
             pendingOrders: current.pendingOrders.filter { $0.id != order.id },
-            trades: current.trades,
+            filledOrders: current.filledOrders,
             analytics: current.analytics,
             fetchedAt: Date()
         )

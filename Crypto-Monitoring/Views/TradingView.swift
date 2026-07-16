@@ -17,14 +17,9 @@ struct TradingView: View {
     @State private var orderType: TradingOrderType = .market
     @State private var sizingMode: TradingSizingMode = .amount
     @State private var priceText = ""
-    @State private var takeProfitEnabled = false
-    @State private var takeProfitText = ""
-    @State private var stopLossEnabled = false
-    @State private var stopLossText = ""
     @State private var orderFormFocusToken = 0
     @State private var showingCredentials = false
     @State private var showingSymbolEditor = false
-    @State private var protectionEditorOrder: PendingOrder?
     @State private var protectionEditorPosition: FuturesPosition?
     @State private var protectionEditorSpotPosition: SpotPosition?
     @State private var activeAlert: TradingAlert?
@@ -108,9 +103,6 @@ struct TradingView: View {
         .sheet(isPresented: $showingSymbolEditor) {
             TradingSymbolEditor(manager: manager, isPresented: $showingSymbolEditor)
         }
-        .sheet(item: $protectionEditorOrder) { order in
-            ExistingOrderProtectionEditor(manager: manager, order: order)
-        }
         .sheet(item: $protectionEditorPosition) { position in
             ExistingPositionProtectionEditor(manager: manager, position: position)
         }
@@ -143,11 +135,7 @@ struct TradingView: View {
                                 closeAll: closeAll,
                                 orderType: orderType,
                                 priceText: priceText,
-                                sizingMode: sizingMode,
-                                takeProfitEnabled: takeProfitEnabled,
-                                takeProfitText: takeProfitText,
-                                stopLossEnabled: stopLossEnabled,
-                                stopLossText: stopLossText
+                                sizingMode: sizingMode
                             )
                         }
                     },
@@ -240,7 +228,7 @@ struct TradingView: View {
                 Label(autoRefreshText, systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .help("账户、持仓、当前委托与最近成交每 10 秒自动刷新；应用进入后台时暂停")
+                    .help("账户、持仓、当前委托与历史成交订单每 10 秒自动刷新；应用进入后台时暂停")
             }
 
             if manager.isLoading {
@@ -444,10 +432,6 @@ struct TradingView: View {
 
                 orderSizingFields
 
-                if !action.isReducing {
-                    protectionOrderFields
-                }
-
                 Button {
                     activeAlert = .submitOrder
                 } label: {
@@ -480,11 +464,6 @@ struct TradingView: View {
                         Text("\(order.side) · \(order.status) · 已成交 \(format(order.executedQuantity))")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        if order.protectionOrderCount > 0 {
-                            Text("已添加 \(order.protectionOrderCount) 个止盈/止损保护单")
-                                .font(.caption2)
-                                .foregroundColor(.green)
-                        }
                     }
                 }
             }
@@ -532,9 +511,11 @@ struct TradingView: View {
                             metricTile("USDT 冻结", quoteBalance?.locked ?? 0, suffix: " USDT", icon: "lock")
                         }
                         Divider()
-                        Text("现货持仓")
-                            .font(.caption.weight(.semibold))
-                            .foregroundColor(.secondary)
+                        positionSectionHeader(
+                            title: "现货持仓",
+                            count: account.spotPositions.count,
+                            icon: "bitcoinsign.circle.fill"
+                        )
                         if account.spotPositions.isEmpty {
                             Text("暂无现货持仓（USDT 余额不计为持仓）")
                                 .foregroundColor(.secondary)
@@ -565,6 +546,11 @@ struct TradingView: View {
                             metricTile("未实现盈亏", account.futuresUnrealizedPnL, suffix: " USDT", colored: true, icon: "chart.line.uptrend.xyaxis")
                         }
                         Divider()
+                        positionSectionHeader(
+                            title: "合约持仓",
+                            count: account.futuresPositions.count,
+                            icon: "chart.line.uptrend.xyaxis.circle.fill"
+                        )
                         if account.futuresPositions.isEmpty {
                             Text("暂无合约持仓").foregroundColor(.secondary)
                         } else {
@@ -577,7 +563,7 @@ struct TradingView: View {
                                         Divider()
                                     }
                                 }
-                                .frame(minWidth: 1060)
+                                .frame(minWidth: 1260)
                                 VStack(spacing: 8) {
                                     ForEach(account.futuresPositions) { position in
                                         compactFuturesPositionRow(position)
@@ -594,10 +580,10 @@ struct TradingView: View {
     }
 
     private var analyticsPanel: some View {
-        TradingCard(title: "最近成交分析（最多 1000 条）", icon: "chart.bar.xaxis") {
+        TradingCard(title: "历史成交订单分析（由最近 1000 条成交汇总）", icon: "chart.bar.xaxis") {
             let analytics = manager.dashboard?.analytics ?? .empty
             LazyVGrid(columns: metricColumns, spacing: 8) {
-                metricTile("成交笔数", Decimal(analytics.tradeCount), icon: "number")
+                metricTile("成交订单数", Decimal(analytics.orderCount), icon: "number")
                 metricTile("成交额", analytics.turnover, suffix: " USDT", icon: "banknote")
                 metricTile("净基础币流入", analytics.netBaseFlow, colored: true, icon: "arrow.left.arrow.right")
                 metricTile("已实现盈亏", analytics.realizedPnL, suffix: manager.market == .perpetual ? " USDT" : "", colored: true, icon: "chart.line.uptrend.xyaxis")
@@ -612,7 +598,9 @@ struct TradingView: View {
     }
 
     private var pendingOrdersPanel: some View {
-        let orders = manager.dashboard?.pendingOrders ?? []
+        let orders = (manager.dashboard?.pendingOrders ?? []).filter { order in
+            !order.isAlgoOrder || (!order.closePosition && !order.reduceOnly)
+        }
         return TradingCard(title: "当前委托（\(orders.count)）", icon: "list.bullet.rectangle.portrait") {
             if manager.dashboard == nil {
                 emptyLoadingView("尚未加载当前委托")
@@ -628,7 +616,7 @@ struct TradingView: View {
                             Divider()
                         }
                     }
-                    .frame(minWidth: 1285)
+                    .frame(minWidth: 1575)
 
                     VStack(spacing: 8) {
                         ForEach(orders) { order in
@@ -651,8 +639,11 @@ struct TradingView: View {
             Text("委托数量").frame(width: 100, alignment: .trailing)
             Text("已成交").frame(width: 100, alignment: .trailing)
             Text("剩余数量").frame(width: 100, alignment: .trailing)
+            Text("预计保证金").frame(width: 110, alignment: .trailing)
+            Text("杠杆倍数").frame(width: 60, alignment: .trailing)
+            Text("预计手续费").frame(width: 120, alignment: .trailing)
             Text("状态").frame(width: 90, alignment: .trailing)
-            Text("操作").frame(width: 150, alignment: .trailing)
+            Text("操作").frame(width: 90, alignment: .trailing)
         }
         .font(.caption.weight(.semibold))
         .foregroundColor(.secondary)
@@ -684,6 +675,13 @@ struct TradingView: View {
             Text(format(order.executedQuantity)).frame(width: 100, alignment: .trailing)
             Text(order.closePosition && order.originalQuantity == 0 ? "全部" : format(order.remainingQuantity))
                 .frame(width: 100, alignment: .trailing)
+            Text(pendingOrderMarginText(order))
+                .frame(width: 110, alignment: .trailing)
+                .help("按剩余委托数量、委托/触发价和当前交易对杠杆估算")
+            Text(pendingOrderLeverageText(order)).frame(width: 60, alignment: .trailing)
+            Text(pendingOrderCommissionText(order))
+                .frame(width: 120, alignment: .trailing)
+                .help("按剩余委托成交额与当前账户 maker/taker 费率估算，未计 BNB 抵扣，实际以成交回报为准")
             Text(pendingOrderStatusText(order.status))
                 .foregroundColor(pendingOrderStatusColor(order.status))
                 .frame(width: 90, alignment: .trailing)
@@ -691,62 +689,108 @@ struct TradingView: View {
                 if manager.cancellingOrderIDs.contains(order.id) {
                     ProgressView().controlSize(.small)
                 } else {
-                    if canAddProtection(to: order) {
-                        Button("止盈止损") {
-                            protectionEditorOrder = order
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(manager.addingProtectionOrderIDs.contains(order.id))
-                    }
                     Button("取消") { activeAlert = .cancelOrder(order) }
                         .foregroundColor(.red)
                         .buttonStyle(.borderless)
                 }
             }
-            .frame(width: 150, alignment: .trailing)
+            .frame(width: 90, alignment: .trailing)
         }
         .font(.caption.monospacedDigit())
         .padding(.vertical, 7)
     }
 
     private func compactPendingOrderRow(_ order: PendingOrder) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 10) {
+        let columns = Array(
+            repeating: GridItem(.flexible(minimum: 110), spacing: 12, alignment: .leading),
+            count: 4
+        )
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: order.isAlgoOrder ? "shield.lefthalf.filled" : "doc.text.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(order.isAlgoOrder ? .purple : .blue)
+                    .frame(width: 30, height: 30)
+                    .background(
+                        Circle().fill((order.isAlgoOrder ? Color.purple : Color.blue).opacity(0.1))
+                    )
                 VStack(alignment: .leading, spacing: 3) {
                     Text(tradingPairDisplayName(order.symbol))
-                        .font(.callout.weight(.semibold))
+                        .font(.callout.weight(.bold))
                     Text("#\(order.orderId) · \(shortDate(order.createdAt))")
                         .font(.caption2.monospacedDigit())
                         .foregroundColor(.secondary)
                 }
                 Spacer()
+                Text(pendingOrderSideText(order))
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(order.side == "BUY" ? .green : .red)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule().fill((order.side == "BUY" ? Color.green : Color.red).opacity(0.1))
+                    )
                 statusBadge(
                     pendingOrderStatusText(order.status),
                     color: pendingOrderStatusColor(order.status)
                 )
             }
 
-            HStack(spacing: 18) {
-                compactValue(
-                    "方向",
-                    pendingOrderSideText(order),
-                    color: order.side == "BUY" ? .green : .red
+            Divider()
+
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                pendingOrderMetric(
+                    "订单类型",
+                    pendingOrderTypeText(order.type),
+                    icon: "slider.horizontal.3"
                 )
-                compactValue("类型", pendingOrderTypeText(order.type))
-                compactValue(
+                pendingOrderMetric(
                     order.price > 0 ? "委托价" : "触发价",
-                    format(order.price > 0 ? order.price : order.triggerPrice)
+                    format(order.price > 0 ? order.price : order.triggerPrice),
+                    icon: "tag"
                 )
-                compactValue(
+                pendingOrderMetric(
                     "剩余数量",
-                    order.closePosition && order.originalQuantity == 0 ? "全部" : format(order.remainingQuantity)
+                    order.closePosition && order.originalQuantity == 0 ? "全部" : format(order.remainingQuantity),
+                    icon: "cube"
+                )
+                pendingOrderMetric(
+                    "已成交",
+                    format(order.executedQuantity),
+                    icon: "chart.bar.fill"
                 )
             }
 
-            HStack {
+            HStack(spacing: 10) {
+                pendingOrderSummaryTile(
+                    "预计保证金",
+                    pendingOrderMarginText(order),
+                    icon: "banknote",
+                    color: .blue
+                )
+                pendingOrderSummaryTile(
+                    "杠杆倍数",
+                    pendingOrderLeverageText(order),
+                    icon: "gauge.with.dots.needle.50percent",
+                    color: .orange
+                )
+                pendingOrderSummaryTile(
+                    "预计手续费",
+                    pendingOrderCommissionText(order),
+                    icon: "receipt",
+                    color: .purple
+                )
+            }
+            .help("保证金按剩余委托名义价值÷当前杠杆估算；手续费按剩余成交额与账户当前 maker/taker 费率估算，未计 BNB 抵扣")
+
+            HStack(spacing: 10) {
                 if order.executedQuantity > 0 {
                     Label("已成交 \(format(order.executedQuantity))", systemImage: "chart.bar.fill")
                         .font(.caption2.monospacedDigit())
+                        .foregroundColor(.secondary)
+                } else {
+                    Label("等待成交", systemImage: "clock")
+                        .font(.caption2)
                         .foregroundColor(.secondary)
                 }
                 Spacer()
@@ -756,49 +800,56 @@ struct TradingView: View {
                         Text("正在取消").font(.caption)
                     }
                 } else {
-                    if canAddProtection(to: order) {
-                        Button {
-                            protectionEditorOrder = order
-                        } label: {
-                            Label("止盈止损", systemImage: "shield.lefthalf.filled")
-                        }
-                        .controlSize(.small)
-                        .disabled(manager.addingProtectionOrderIDs.contains(order.id))
-                    }
                     Button(role: .destructive) {
                         activeAlert = .cancelOrder(order)
                     } label: {
                         Label("取消委托", systemImage: "xmark.circle")
                     }
+                    .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
             }
         }
-        .padding(11)
-        .background(compactRowBackground)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(NSColor.windowBackgroundColor).opacity(0.72))
+                .shadow(color: .black.opacity(0.035), radius: 4, y: 2)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(NSColor.separatorColor).opacity(0.45), lineWidth: 1)
+        )
     }
 
     private var tradeHistoryPanel: some View {
-        TradingCard(title: "最近成交", icon: "clock.arrow.circlepath") {
-            if let trades = manager.dashboard?.trades, !trades.isEmpty {
-                VStack(spacing: 0) {
+        let orders = manager.dashboard?.filledOrders ?? []
+        return TradingCard(title: "历史成交订单（\(orders.count)）", icon: "clock.arrow.circlepath") {
+            if !orders.isEmpty {
+                LazyVStack(spacing: 0) {
                     tradeRowHeader
                     Divider()
-                    ForEach(trades.prefix(30)) { trade in
+                    ForEach(orders) { order in
                         HStack {
-                            Text(shortDate(trade.time)).frame(width: 130, alignment: .leading)
-                            Text(trade.sideText)
-                                .foregroundColor(trade.isBuyer ? .green : .red)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("#\(order.orderId)")
+                                Text(shortDate(order.time)).foregroundColor(.secondary)
+                            }
+                            .frame(width: 140, alignment: .leading)
+                            Text(order.sideText)
+                                .foregroundColor(order.isBuyer ? .green : .red)
                                 .frame(width: 55, alignment: .leading)
-                            Text(format(trade.price)).frame(maxWidth: .infinity, alignment: .trailing)
-                            Text(format(trade.quantity)).frame(maxWidth: .infinity, alignment: .trailing)
-                            Text(format(trade.quoteQuantity)).frame(maxWidth: .infinity, alignment: .trailing)
-                            Text(trade.realizedPnL.map(signed) ?? "—")
-                                .foregroundColor((trade.realizedPnL ?? 0) >= 0 ? .green : .red)
+                            Text(format(order.price)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(format(order.quantity)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(format(order.quoteQuantity)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(order.realizedPnL.map(signed) ?? "—")
+                                .foregroundColor((order.realizedPnL ?? 0) >= 0 ? .green : .red)
+                                .frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(commissionText(order.commissions))
                                 .frame(maxWidth: .infinity, alignment: .trailing)
                             HStack(spacing: 5) {
-                                Button("再开") { prepareTradeAction(trade, action: .open) }
-                                Button("平仓") { prepareTradeAction(trade, action: .close) }
+                                Button("再开") { prepareTradeAction(order, action: .open) }
+                                Button("平仓") { prepareTradeAction(order, action: .close) }
                             }
                             .buttonStyle(.borderless)
                             .frame(width: 90, alignment: .trailing)
@@ -809,19 +860,20 @@ struct TradingView: View {
                     }
                 }
             } else {
-                emptyLoadingView("当前交易对暂无成交记录")
+                emptyLoadingView("当前交易对暂无历史成交订单")
             }
         }
     }
 
     private var tradeRowHeader: some View {
         HStack {
-            Text("时间").frame(width: 130, alignment: .leading)
+            Text("订单号 / 成交时间").frame(width: 140, alignment: .leading)
             Text("方向").frame(width: 55, alignment: .leading)
             Text("价格").frame(maxWidth: .infinity, alignment: .trailing)
             Text("数量").frame(maxWidth: .infinity, alignment: .trailing)
             Text("成交额").frame(maxWidth: .infinity, alignment: .trailing)
             Text("已实现盈亏").frame(maxWidth: .infinity, alignment: .trailing)
+            Text("手续费").frame(maxWidth: .infinity, alignment: .trailing)
             Text("快捷操作").frame(width: 90, alignment: .trailing)
         }
         .font(.caption.weight(.semibold))
@@ -854,49 +906,7 @@ struct TradingView: View {
             ? (action.isReducing ? "卖出" : "买入")
             : direction.displayName
         let priceLine = orderType == .limit ? "\n委托价格：\(priceText) USDT" : ""
-        let protectionLines = [
-            takeProfitEnabled && !action.isReducing ? "止盈触发价：\(takeProfitText) USDT" : nil,
-            stopLossEnabled && !action.isReducing ? "止损触发价：\(stopLossText) USDT" : nil
-        ].compactMap { $0 }
-        let protectionText = protectionLines.isEmpty
-            ? ""
-            : "\n\n保护单：\n" + protectionLines.joined(separator: "\n")
-        return "环境：\(manager.environment.displayName)\n市场：\(manager.market.displayName)\n交易对：\(manager.symbol.uppercased())\n操作：\(action.displayName) / \(side)\n\(sizing)\n\n订单类型：\(orderType.displayName)单\(priceLine)\(protectionText)"
-    }
-
-    private var protectionOrderFields: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            Label("止盈止损（可选）", systemImage: "shield.lefthalf.filled")
-                .font(.caption.weight(.semibold))
-                .foregroundColor(.secondary)
-
-            Toggle("添加止盈", isOn: $takeProfitEnabled)
-                .toggleStyle(.switch)
-            if takeProfitEnabled {
-                TextField("止盈触发价（USDT）", text: $takeProfitText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospacedDigit())
-            }
-
-            Toggle("添加止损", isOn: $stopLossEnabled)
-                .toggleStyle(.switch)
-            if stopLossEnabled {
-                TextField("止损触发价（USDT）", text: $stopLossText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospacedDigit())
-            }
-
-            Text(manager.market == .perpetual
-                 ? "按标记价格触发并市价平掉该方向全部持仓；条件委托会显示在“当前委托”中"
-                 : (orderType == .limit
-                    ? "限价买入使用 OTO/OTOCO，入场单完全成交后才激活保护单"
-                    : "市价买入成交后创建卖出保护单"))
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Color.secondary.opacity(0.06)))
+        return "环境：\(manager.environment.displayName)\n市场：\(manager.market.displayName)\n交易对：\(manager.symbol.uppercased())\n操作：\(action.displayName) / \(side)\n\(sizing)\n\n订单类型：\(orderType.displayName)单\(priceLine)"
     }
 
     @ViewBuilder
@@ -1040,9 +1050,6 @@ struct TradingView: View {
         if orderType == .limit && (parsedDecimal(priceText) ?? 0) <= 0 {
             return "请输入有效的限价价格"
         }
-        if let protectionHint = protectionValidationHint {
-            return protectionHint
-        }
         if manager.market == .spot {
             if action == .close && closeAll { return nil }
             if !action.isReducing && sizingMode == .amount {
@@ -1091,7 +1098,6 @@ struct TradingView: View {
 
     private var isOrderInputValid: Bool {
         if orderType == .limit && (parsedDecimal(priceText) ?? 0) <= 0 { return false }
-        if protectionValidationHint != nil { return false }
         if manager.market == .spot {
             if action == .close && closeAll { return true }
             if !action.isReducing && sizingMode == .amount {
@@ -1105,27 +1111,6 @@ struct TradingView: View {
             : (parsedDecimal(amountText) ?? 0) > 0
         guard hasSize else { return false }
         return action.isReducing ? selectedPosition != nil : (1...125).contains(leverage)
-    }
-
-    private var protectionValidationHint: String? {
-        guard !action.isReducing else { return nil }
-        let takeProfit = parsedDecimal(takeProfitText)
-        let stopLoss = parsedDecimal(stopLossText)
-        if takeProfitEnabled && (takeProfit ?? 0) <= 0 { return "请输入有效的止盈触发价" }
-        if stopLossEnabled && (stopLoss ?? 0) <= 0 { return "请输入有效的止损触发价" }
-
-        // 市价单会由服务端使用最新价格再次校验；限价单可在预览前直接校验方向。
-        guard orderType == .limit, let entry = parsedDecimal(priceText), entry > 0 else { return nil }
-        let isLongProtection = manager.market == .spot || direction == .long
-        if let takeProfit, takeProfitEnabled {
-            if isLongProtection && takeProfit <= entry { return "做多/现货的止盈价必须高于入场价" }
-            if !isLongProtection && takeProfit >= entry { return "做空的止盈价必须低于入场价" }
-        }
-        if let stopLoss, stopLossEnabled {
-            if isLongProtection && stopLoss >= entry { return "做多/现货的止损价必须低于入场价" }
-            if !isLongProtection && stopLoss <= entry { return "做空的止损价必须高于入场价" }
-        }
-        return nil
     }
 
     private func parsedDecimal(_ text: String) -> Decimal? {
@@ -1192,58 +1177,113 @@ struct TradingView: View {
         }
         .font(.caption.monospacedDigit())
         .padding(.vertical, 7)
-        .help(position.averageCost == nil ? "系统会分批拉取最近成交；充值或测试网赠送资产没有买入成交，因此无法计算成本" : "盈亏按最多 1000 笔最近成交推算的持仓成本计算")
+        .help(position.averageCost == nil ? "系统会分批拉取最近成交流水；充值或测试网赠送资产没有买入成交，因此无法计算成本" : "盈亏按最多 1000 笔最近成交流水推算的持仓成本计算")
     }
 
     private func compactSpotPositionRow(_ position: SpotPosition) -> some View {
-        VStack(alignment: .leading, spacing: 11) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(position.asset)
-                        .font(.callout.weight(.semibold))
-                    Text("现货 · 1x")
-                        .font(.caption2)
+        let pnlColor = spotPnLColor(position.unrealizedPnL)
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 11) {
+                Image(systemName: "bitcoinsign")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundColor(.blue)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Color.blue.opacity(0.11)))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
+                        Text(position.asset)
+                            .font(.headline.weight(.bold))
+                        statusBadge("现货", color: .blue)
+                        statusBadge("1x", color: .secondary)
+                    }
+                    Text("持仓价值  \(position.marketValue.map { "\(format($0)) USDT" } ?? "—")")
+                        .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
                 }
-                Spacer()
+
+                Spacer(minLength: 12)
+
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text(position.marketValue.map { "\(format($0)) USDT" } ?? "—")
-                        .font(.callout.monospacedDigit().weight(.semibold))
-                    Text(position.unrealizedPnL.map(signed) ?? "成本待加载")
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(spotPnLColor(position.unrealizedPnL))
+                    Text("未实现盈亏")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(position.unrealizedPnL.map(signed) ?? "—")
+                        .font(.title3.monospacedDigit().weight(.bold))
+                        .foregroundColor(pnlColor)
+                    Text(position.pnlRate.map { "\(signed($0))%" }
+                         ?? (position.hasLoadedTradeHistory ? "无买入记录" : "成本待加载"))
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundColor(pnlColor)
                 }
             }
 
-            HStack(spacing: 16) {
-                compactValue("数量", format(position.quantity))
-                compactValue("成本单价", position.averageCost.map(format) ?? "—")
-                compactValue("当前单价", position.currentPrice.map(format) ?? "—")
-                compactValue("收益率", position.pnlRate.map { "\(signed($0))%" } ?? "—", color: spotPnLColor(position.unrealizedPnL))
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2),
+                spacing: 8
+            ) {
+                positionDataTile("持仓数量", format(position.quantity), icon: "cube.fill", color: .blue)
+                positionDataTile("可用数量", format(position.free), icon: "checkmark.circle.fill", color: .green)
+                positionDataTile("成本单价", position.averageCost.map(format) ?? "—", icon: "building.columns.fill", color: .orange)
+                positionDataTile("当前单价", position.currentPrice.map(format) ?? "—", icon: "waveform.path.ecg", color: .purple)
             }
 
             HStack(spacing: 8) {
                 if position.locked > 0 {
-                    Label("冻结 \(format(position.locked))", systemImage: "lock")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundColor(.secondary)
+                    Label("冻结 \(format(position.locked))", systemImage: "lock.fill")
+                        .font(.caption2.monospacedDigit().weight(.medium))
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(Color.orange.opacity(0.1)))
+                } else {
+                    Label("全部可用", systemImage: "checkmark.shield.fill")
+                        .font(.caption2.weight(.medium))
+                        .foregroundColor(.green)
                 }
                 Spacer()
-                Button("止盈止损") { protectionEditorSpotPosition = position }
-                    .disabled(position.free <= 0 || manager.addingProtectionOrderIDs.contains(position.id))
-                Button("加仓") { prepareSpotPositionAction(position, action: .add) }
-                Button("减仓") { prepareSpotPositionAction(position, action: .reduce) }
-                    .disabled(position.free <= 0)
-                Button("平仓") { prepareSpotPositionAction(position, action: .close) }
-                    .disabled(position.free <= 0)
-                    .tint(.orange)
+            }
+
+            Divider().opacity(0.7)
+
+            HStack(spacing: 7) {
+                Button {
+                    protectionEditorSpotPosition = position
+                } label: {
+                    Label("止盈止损", systemImage: "shield.lefthalf.filled")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+                .disabled(position.free <= 0 || manager.addingProtectionOrderIDs.contains(position.id))
+
+                Spacer(minLength: 4)
+
+                Button {
+                    prepareSpotPositionAction(position, action: .add)
+                } label: {
+                    Label("加仓", systemImage: "plus")
+                }
+                Button {
+                    prepareSpotPositionAction(position, action: .reduce)
+                } label: {
+                    Label("减仓", systemImage: "minus")
+                }
+                .disabled(position.free <= 0)
+                Button {
+                    prepareSpotPositionAction(position, action: .close)
+                } label: {
+                    Label("平仓", systemImage: "xmark")
+                }
+                .tint(.orange)
+                .disabled(position.free <= 0)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
         }
-        .padding(11)
-        .background(compactRowBackground)
-        .help(position.averageCost == nil ? "系统会分批拉取最近成交；充值或测试网赠送资产没有买入成交，因此无法计算成本" : "盈亏按最多 1000 笔最近成交推算的持仓成本计算")
+        .padding(15)
+        .background(positionCardBackground(accent: .blue))
+        .shadow(color: .black.opacity(0.04), radius: 7, y: 3)
+        .help(position.averageCost == nil ? "系统会分批拉取最近成交流水；充值或测试网赠送资产没有买入成交，因此无法计算成本" : "盈亏按最多 1000 笔最近成交流水推算的持仓成本计算")
     }
 
     private func spotPnLColor(_ pnl: Decimal?) -> Color {
@@ -1280,6 +1320,7 @@ struct TradingView: View {
             Text("倍数").frame(width: 55, alignment: .trailing)
             Text("数量").frame(width: 90, alignment: .trailing)
             Text("盈亏/收益率").frame(width: 115, alignment: .trailing)
+            Text("止盈 / 止损").frame(width: 180, alignment: .trailing)
             Text("快捷操作").frame(width: 210, alignment: .trailing)
         }
         .font(.caption.weight(.semibold))
@@ -1288,7 +1329,14 @@ struct TradingView: View {
     }
 
     private func positionRow(_ position: FuturesPosition) -> some View {
-        HStack(spacing: 10) {
+        let protectionOrders = futuresProtectionOrders(for: position)
+        let takeProfitPrices = protectionOrders
+            .filter { $0.type.contains("TAKE_PROFIT") }
+            .map { $0.triggerPrice > 0 ? $0.triggerPrice : $0.price }
+        let stopLossPrices = protectionOrders
+            .filter { $0.type.contains("STOP") && !$0.type.contains("TAKE_PROFIT") }
+            .map { $0.triggerPrice > 0 ? $0.triggerPrice : $0.price }
+        return HStack(spacing: 10) {
             HStack(spacing: 5) {
                 Text(position.symbol).fontWeight(.semibold)
                 Text(position.directionText)
@@ -1309,8 +1357,17 @@ struct TradingView: View {
             }
             .foregroundColor(position.unrealizedPnL >= 0 ? .green : .red)
             .frame(width: 115, alignment: .trailing)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("止盈 \(pendingOrderProtectionText(takeProfitPrices))")
+                    .foregroundColor(takeProfitPrices.isEmpty ? .secondary : .green)
+                Text("止损 \(pendingOrderProtectionText(stopLossPrices))")
+                    .foregroundColor(stopLossPrices.isEmpty ? .secondary : .red)
+            }
+            .frame(width: 180, alignment: .trailing)
             HStack(spacing: 6) {
-                Button("止盈止损") { protectionEditorPosition = position }
+                Button(protectionOrders.isEmpty ? "设置止盈止损" : "修改止盈止损") {
+                    protectionEditorPosition = position
+                }
                     .disabled(manager.addingProtectionOrderIDs.contains(position.id))
                 Button("加仓") { preparePositionAction(position, action: .add) }
                 Button("减仓") { preparePositionAction(position, action: .reduce) }
@@ -1325,52 +1382,115 @@ struct TradingView: View {
 
     private func compactFuturesPositionRow(_ position: FuturesPosition) -> some View {
         let directionColor: Color = position.directionText == "多" ? .green : .red
-        return VStack(alignment: .leading, spacing: 11) {
-            HStack(alignment: .top, spacing: 10) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
+        let pnlColor: Color = position.unrealizedPnL >= 0 ? .green : .red
+        let protectionOrders = futuresProtectionOrders(for: position)
+        let takeProfitPrices = protectionOrders
+            .filter { $0.type.contains("TAKE_PROFIT") }
+            .map { $0.triggerPrice > 0 ? $0.triggerPrice : $0.price }
+        let stopLossPrices = protectionOrders
+            .filter { $0.type.contains("STOP") && !$0.type.contains("TAKE_PROFIT") }
+            .map { $0.triggerPrice > 0 ? $0.triggerPrice : $0.price }
+
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 11) {
+                Image(systemName: position.directionText == "多" ? "arrow.up.right" : "arrow.down.right")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(directionColor)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(directionColor.opacity(0.11)))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 7) {
                         Text(tradingPairDisplayName(position.symbol))
-                            .font(.callout.weight(.semibold))
-                        statusBadge(position.directionText, color: directionColor)
+                            .font(.headline.weight(.bold))
+                        statusBadge("\(position.directionText)仓", color: directionColor)
+                        statusBadge("\(position.leverage)x", color: .orange)
                     }
-                    Text("逐仓/全仓以 Binance 账户设置为准")
-                        .font(.caption2)
+                    Text("名义价值  \(format(position.absoluteNotionalValue)) \(position.marginAsset)")
+                        .font(.caption.monospacedDigit())
                         .foregroundColor(.secondary)
                 }
-                Spacer()
+
+                Spacer(minLength: 12)
+
                 VStack(alignment: .trailing, spacing: 3) {
-                    Text("\(format(position.absoluteNotionalValue)) \(position.marginAsset)")
-                        .font(.callout.monospacedDigit().weight(.semibold))
-                    Text("\(signed(position.unrealizedPnL)) · \(position.pnlRate.map { "\(signed($0))%" } ?? "—")")
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(position.unrealizedPnL >= 0 ? .green : .red)
+                    Text("未实现盈亏")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text(signed(position.unrealizedPnL))
+                        .font(.title3.monospacedDigit().weight(.bold))
+                        .foregroundColor(pnlColor)
+                    Text(position.pnlRate.map { "\(signed($0))%" } ?? "—")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                        .foregroundColor(pnlColor)
                 }
             }
 
-            HStack(spacing: 16) {
-                compactValue("开仓单价", format(position.entryPrice))
-                compactValue("标记单价", format(position.markPrice))
-                compactValue("数量", format(position.absoluteAmount))
-                compactValue("杠杆", "\(position.leverage)x")
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2),
+                spacing: 8
+            ) {
+                positionDataTile("开仓单价", format(position.entryPrice), icon: "flag.checkered", color: directionColor)
+                positionDataTile("标记单价", format(position.markPrice), icon: "waveform.path.ecg", color: .purple)
+                positionDataTile("持仓数量", format(position.absoluteAmount), icon: "cube.fill", color: .blue)
+                positionDataTile("占用保证金", "\(format(position.initialMargin)) \(position.marginAsset)", icon: "shield.fill", color: .orange)
             }
 
-            HStack(spacing: 8) {
-                Label("保证金 \(format(position.initialMargin))", systemImage: "shield")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundColor(.secondary)
-                Spacer()
-                Button("止盈止损") { protectionEditorPosition = position }
-                    .disabled(manager.addingProtectionOrderIDs.contains(position.id))
-                Button("加仓") { preparePositionAction(position, action: .add) }
-                Button("减仓") { preparePositionAction(position, action: .reduce) }
-                Button("平仓") { preparePositionAction(position, action: .close) }
-                    .tint(.orange)
+            HStack(spacing: 10) {
+                pendingOrderProtectionTile(
+                    "止盈",
+                    prices: takeProfitPrices,
+                    icon: "arrow.up.right",
+                    color: .green
+                )
+                pendingOrderProtectionTile(
+                    "止损",
+                    prices: stopLossPrices,
+                    icon: "arrow.down.right",
+                    color: .red
+                )
+            }
+
+            Divider().opacity(0.7)
+
+            HStack(spacing: 7) {
+                Button {
+                    protectionEditorPosition = position
+                } label: {
+                    Label(
+                        protectionOrders.isEmpty ? "设置保护" : "修改保护",
+                        systemImage: "shield.lefthalf.filled"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+                .disabled(manager.addingProtectionOrderIDs.contains(position.id))
+
+                Spacer(minLength: 4)
+
+                Button {
+                    preparePositionAction(position, action: .add)
+                } label: {
+                    Label("加仓", systemImage: "plus")
+                }
+                Button {
+                    preparePositionAction(position, action: .reduce)
+                } label: {
+                    Label("减仓", systemImage: "minus")
+                }
+                Button {
+                    preparePositionAction(position, action: .close)
+                } label: {
+                    Label("平仓", systemImage: "xmark")
+                }
+                .tint(.orange)
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
         }
-        .padding(11)
-        .background(compactRowBackground)
+        .padding(15)
+        .background(positionCardBackground(accent: directionColor))
+        .shadow(color: .black.opacity(0.04), radius: 7, y: 3)
     }
 
     private func preparePositionAction(_ position: FuturesPosition, action: TradingAction) {
@@ -1387,20 +1507,20 @@ struct TradingView: View {
         orderFormFocusToken += 1
     }
 
-    private func prepareTradeAction(_ trade: TradeRecord, action: TradingAction) {
-        manager.selectTradingSymbol(trade.symbol)
-        if trade.positionSide == "LONG" {
+    private func prepareTradeAction(_ order: FilledOrderRecord, action: TradingAction) {
+        manager.selectTradingSymbol(order.symbol)
+        if order.positionSide == "LONG" {
             direction = .long
-        } else if trade.positionSide == "SHORT" {
+        } else if order.positionSide == "SHORT" {
             direction = .short
         } else {
-            direction = trade.isBuyer ? .long : .short
+            direction = order.isBuyer ? .long : .short
         }
         self.action = action
         orderType = .limit
-        priceText = trade.price.plainString
+        priceText = order.price.plainString
         sizingMode = .quantity
-        quantityText = trade.quantity.plainString
+        quantityText = order.quantity.plainString
         amountText = ""
         closeAll = false
         orderFormFocusToken += 1
@@ -1447,18 +1567,160 @@ struct TradingView: View {
         .background(compactRowBackground)
     }
 
-    private func compactValue(_ title: String, _ value: String, color: Color = .primary) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    private func positionSectionHeader(title: String, count: Int, icon: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .foregroundColor(.blue)
             Text(title)
+                .font(.callout.weight(.semibold))
+            Text("\(count) 个持仓")
+                .font(.caption2.weight(.semibold))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.secondary.opacity(0.09)))
+            Spacer()
+            Text("价格与盈亏实时更新")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func positionDataTile(
+        _ title: String,
+        _ value: String,
+        icon: String,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(color)
+                .frame(width: 25, height: 25)
+                .background(Circle().fill(color.opacity(0.1)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(value)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.68)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, minHeight: 40, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(color.opacity(0.045))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(color.opacity(0.11), lineWidth: 1)
+        )
+    }
+
+    private func positionCardBackground(accent: Color) -> some View {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 14)
+                .fill(Color(NSColor.windowBackgroundColor).opacity(0.76))
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(accent.opacity(0.2), lineWidth: 1)
+            Capsule()
+                .fill(accent.opacity(0.75))
+                .frame(width: 3)
+                .padding(.vertical, 12)
+                .padding(.leading, 1)
+        }
+    }
+
+    private func pendingOrderMetric(
+        _ title: String,
+        _ value: String,
+        icon: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(title, systemImage: icon)
                 .font(.caption2)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.caption.monospacedDigit().weight(.medium))
-                .foregroundColor(color)
+                .font(.caption.monospacedDigit().weight(.semibold))
                 .lineLimit(1)
-                .minimumScaleFactor(0.75)
+                .minimumScaleFactor(0.72)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func pendingOrderSummaryTile(
+        _ title: String,
+        _ value: String,
+        icon: String,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(color)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(color.opacity(0.12)))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                Text(value)
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(color.opacity(0.055))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(color.opacity(0.14), lineWidth: 1)
+        )
+    }
+
+    private func pendingOrderProtectionTile(
+        _ title: String,
+        prices: [Decimal],
+        icon: String,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(color)
+                .frame(width: 24, height: 24)
+                .background(Circle().fill(color.opacity(0.12)))
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(color)
+            Spacer(minLength: 8)
+            Text(prices.isEmpty ? "未设置" : pendingOrderProtectionText(prices))
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .foregroundColor(prices.isEmpty ? .secondary : color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
+        .background(
+            RoundedRectangle(cornerRadius: 9)
+                .fill(color.opacity(prices.isEmpty ? 0.025 : 0.055))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(color.opacity(prices.isEmpty ? 0.08 : 0.16), lineWidth: 1)
+        )
     }
 
     private func statusBadge(_ text: String, color: Color) -> some View {
@@ -1519,13 +1781,42 @@ struct TradingView: View {
         return parts.joined(separator: "·")
     }
 
-    private func canAddProtection(to order: PendingOrder) -> Bool {
-        manager.market == .perpetual
-            && !order.isAlgoOrder
-            && !order.reduceOnly
-            && !order.closePosition
-            && order.remainingQuantity > 0
-            && (order.type == "LIMIT" || order.type == "MARKET")
+    private func pendingOrderMarginText(_ order: PendingOrder) -> String {
+        guard let margin = order.estimatedMargin else { return "—" }
+        return "≈\(format(margin)) USDT"
+    }
+
+    private func pendingOrderLeverageText(_ order: PendingOrder) -> String {
+        order.leverage.map { "\($0)x" } ?? "—"
+    }
+
+    private func pendingOrderCommissionText(_ order: PendingOrder) -> String {
+        guard let commission = order.estimatedCommission else { return "—" }
+        let asset = order.estimatedCommissionAsset.map { " \($0)" } ?? ""
+        return "≈\(format(commission))\(asset)"
+    }
+
+    private func pendingOrderProtectionText(_ prices: [Decimal]) -> String {
+        guard !prices.isEmpty else { return "—" }
+        return prices.map(format).joined(separator: " / ")
+    }
+
+    private func futuresProtectionOrders(for position: FuturesPosition) -> [PendingOrder] {
+        let isLong = position.positionSide == "LONG"
+            || (position.positionSide == "BOTH" && position.amount > 0)
+        return (manager.dashboard?.pendingOrders ?? []).filter { order in
+            guard order.isAlgoOrder,
+                  order.symbol == position.symbol,
+                  order.closePosition || order.reduceOnly,
+                  order.type.contains("TAKE_PROFIT") || order.type.contains("STOP") else {
+                return false
+            }
+            let sideMatches = isLong ? order.side == "SELL" : order.side == "BUY"
+            let positionSideMatches = order.positionSide == position.positionSide
+                || order.positionSide == "BOTH"
+                || position.positionSide == "BOTH"
+            return sideMatches && positionSideMatches
+        }
     }
 
     private func pendingOrderTypeText(_ type: String) -> String {
@@ -1601,7 +1892,7 @@ private enum TradingPageSection: String, CaseIterable, Identifiable {
         case .overview: return "持仓总览"
         case .orders: return "当前委托"
         case .analytics: return "交易分析"
-        case .trades: return "最近成交"
+        case .trades: return "历史成交订单"
         }
     }
 
@@ -1840,175 +2131,6 @@ private struct TradingSymbolEditor: View {
     }
 }
 
-private struct ExistingOrderProtectionEditor: View {
-    @ObservedObject var manager: TradingManager
-    let order: PendingOrder
-
-    @Environment(\.dismiss) private var dismiss
-    @State private var takeProfitEnabled = true
-    @State private var takeProfitText = ""
-    @State private var stopLossEnabled = true
-    @State private var stopLossText = ""
-    @State private var showingConfirmation = false
-
-    private static let decimalLocale = Locale(identifier: "en_US_POSIX")
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("为已有委托添加止盈止损")
-                .font(.title2.weight(.semibold))
-            Text("\(order.symbol) · #\(order.orderId) · \(directionText)")
-                .font(.callout.monospacedDigit())
-                .foregroundColor(.secondary)
-
-            Label(
-                "保护单使用标记价格触发，并按市价平掉该方向全部持仓。原入场委托不会被取消或修改。",
-                systemImage: "info.circle"
-            )
-            .font(.callout)
-            .foregroundColor(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-
-            if hasExistingProtection {
-                Label("当前交易对已经存在条件保护单；继续添加会形成多组触发条件。", systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundColor(.orange)
-            }
-
-            Toggle("添加止盈", isOn: $takeProfitEnabled)
-            if takeProfitEnabled {
-                TextField("止盈触发价（USDT）", text: $takeProfitText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospacedDigit())
-            }
-
-            Toggle("添加止损", isOn: $stopLossEnabled)
-            if stopLossEnabled {
-                TextField("止损触发价（USDT）", text: $stopLossText)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospacedDigit())
-            }
-
-            if let validationMessage {
-                Label(validationMessage, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundColor(.red)
-            }
-
-            if manager.environment.isLive && !manager.liveTradingEnabled {
-                Label("请先在交易页开启“允许实盘下单”", systemImage: "lock.fill")
-                    .font(.caption)
-                    .foregroundColor(.orange)
-            }
-
-            HStack {
-                Spacer()
-                Button("取消") { dismiss() }
-                Button {
-                    showingConfirmation = true
-                } label: {
-                    if isSubmitting {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Text("预览并添加")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    validationMessage != nil
-                        || isSubmitting
-                        || (manager.environment.isLive && !manager.liveTradingEnabled)
-                )
-            }
-        }
-        .padding(22)
-        .frame(width: 500)
-        .alert("确认添加保护单？", isPresented: $showingConfirmation) {
-            Button("确认添加", role: .destructive) {
-                Task {
-                    let succeeded = await manager.addProtection(
-                        to: order,
-                        takeProfitText: takeProfitEnabled ? takeProfitText : "",
-                        stopLossText: stopLossEnabled ? stopLossText : ""
-                    )
-                    if succeeded { dismiss() }
-                }
-            }
-            Button("返回", role: .cancel) {}
-        } message: {
-            Text(confirmationText)
-        }
-    }
-
-    private var isSubmitting: Bool {
-        manager.addingProtectionOrderIDs.contains(order.id)
-    }
-
-    private var isLong: Bool {
-        if order.positionSide == "LONG" { return true }
-        if order.positionSide == "SHORT" { return false }
-        return order.side == "BUY"
-    }
-
-    private var directionText: String {
-        isLong ? "做多入场" : "做空入场"
-    }
-
-    private var hasExistingProtection: Bool {
-        manager.dashboard?.pendingOrders.contains {
-            $0.isAlgoOrder && $0.symbol == order.symbol
-        } ?? false
-    }
-
-    private var validationMessage: String? {
-        guard takeProfitEnabled || stopLossEnabled else {
-            return "请至少启用止盈或止损"
-        }
-
-        let takeProfit = decimal(takeProfitText)
-        let stopLoss = decimal(stopLossText)
-        if takeProfitEnabled && (takeProfit ?? 0) <= 0 {
-            return "请输入有效的止盈触发价"
-        }
-        if stopLossEnabled && (stopLoss ?? 0) <= 0 {
-            return "请输入有效的止损触发价"
-        }
-
-        guard order.price > 0 else { return nil }
-        if let takeProfit, takeProfitEnabled {
-            if isLong && takeProfit <= order.price { return "做多止盈价必须高于委托价" }
-            if !isLong && takeProfit >= order.price { return "做空止盈价必须低于委托价" }
-        }
-        if let stopLoss, stopLossEnabled {
-            if isLong && stopLoss >= order.price { return "做多止损价必须低于委托价" }
-            if !isLong && stopLoss <= order.price { return "做空止损价必须高于委托价" }
-        }
-        return nil
-    }
-
-    private var confirmationText: String {
-        var lines = [
-            "环境：\(manager.environment.displayName)",
-            "交易对：\(order.symbol)",
-            "原委托：#\(order.orderId)（不会修改）",
-            "方向：\(directionText)"
-        ]
-        if takeProfitEnabled { lines.append("止盈：\(takeProfitText) USDT") }
-        if stopLossEnabled { lines.append("止损：\(stopLossText) USDT") }
-        lines.append("触发后将市价平掉该方向全部持仓。")
-        return lines.joined(separator: "\n")
-    }
-
-    private func decimal(_ text: String) -> Decimal? {
-        Decimal(
-            string: text
-                .replacingOccurrences(of: ",", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            locale: Self.decimalLocale
-        )
-    }
-}
-
 private struct ExistingPositionProtectionEditor: View {
     @ObservedObject var manager: TradingManager
     let position: FuturesPosition
@@ -2024,14 +2146,14 @@ private struct ExistingPositionProtectionEditor: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("为现有持仓添加止盈止损")
+            Text(hasExistingProtection ? "修改持仓止盈止损" : "设置持仓止盈止损")
                 .font(.title2.weight(.semibold))
             Text("\(position.symbol) · \(directionText) · \(position.leverage)x")
                 .font(.callout.monospacedDigit())
                 .foregroundColor(.secondary)
 
             Label(
-                "保护单使用标记价格触发，并按市价平掉该方向全部持仓。当前仓位不会被立即修改。",
+                "保护单使用标记价格触发，并按市价平掉该方向全部持仓。保存时会替换该方向现有的止盈止损。",
                 systemImage: "info.circle"
             )
             .font(.callout)
@@ -2046,19 +2168,19 @@ private struct ExistingPositionProtectionEditor: View {
             .foregroundColor(.secondary)
 
             if hasExistingProtection {
-                Label("当前方向已经存在条件保护单；继续添加会形成多组触发条件。", systemImage: "exclamationmark.triangle.fill")
+                Label("已自动带入当前数值。新保护单创建成功后才会撤销对应旧单。", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption)
-                    .foregroundColor(.orange)
+                    .foregroundColor(.blue)
             }
 
-            Toggle("添加止盈", isOn: $takeProfitEnabled)
+            Toggle("启用止盈", isOn: $takeProfitEnabled)
             if takeProfitEnabled {
                 TextField("止盈触发价（USDT）", text: $takeProfitText)
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospacedDigit())
             }
 
-            Toggle("添加止损", isOn: $stopLossEnabled)
+            Toggle("启用止损", isOn: $stopLossEnabled)
             if stopLossEnabled {
                 TextField("止损触发价（USDT）", text: $stopLossText)
                     .textFieldStyle(.roundedBorder)
@@ -2086,7 +2208,7 @@ private struct ExistingPositionProtectionEditor: View {
                     if isSubmitting {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text("预览并添加")
+                        Text(hasExistingProtection ? "预览修改" : "预览设置")
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -2099,11 +2221,13 @@ private struct ExistingPositionProtectionEditor: View {
         }
         .padding(22)
         .frame(width: 500)
-        .alert("确认添加持仓保护？", isPresented: $showingConfirmation) {
-            Button("确认添加", role: .destructive) {
+        .onAppear(perform: loadExistingValues)
+        .alert(hasExistingProtection ? "确认修改持仓保护？" : "确认设置持仓保护？", isPresented: $showingConfirmation) {
+            Button(hasExistingProtection ? "确认修改" : "确认设置", role: .destructive) {
                 Task {
-                    let succeeded = await manager.addProtection(
+                    let succeeded = await manager.updateProtection(
                         to: position,
+                        replacing: existingProtectionOrders,
                         takeProfitText: takeProfitEnabled ? takeProfitText : "",
                         stopLossText: stopLossEnabled ? stopLossText : ""
                     )
@@ -2131,12 +2255,23 @@ private struct ExistingPositionProtectionEditor: View {
     }
 
     private var hasExistingProtection: Bool {
-        manager.dashboard?.pendingOrders.contains { order in
-            guard order.isAlgoOrder, order.symbol == position.symbol else { return false }
-            return order.positionSide == position.positionSide
+        !existingProtectionOrders.isEmpty
+    }
+
+    private var existingProtectionOrders: [PendingOrder] {
+        (manager.dashboard?.pendingOrders ?? []).filter { order in
+            guard order.isAlgoOrder,
+                  order.symbol == position.symbol,
+                  order.closePosition || order.reduceOnly,
+                  order.type.contains("TAKE_PROFIT") || order.type.contains("STOP") else {
+                return false
+            }
+            let sideMatches = isLong ? order.side == "SELL" : order.side == "BUY"
+            let positionSideMatches = order.positionSide == position.positionSide
                 || order.positionSide == "BOTH"
                 || position.positionSide == "BOTH"
-        } ?? false
+            return sideMatches && positionSideMatches
+        }
     }
 
     private var validationMessage: String? {
@@ -2172,12 +2307,28 @@ private struct ExistingPositionProtectionEditor: View {
             "环境：\(manager.environment.displayName)",
             "持仓：\(position.symbol) \(directionText)",
             "数量：\(position.absoluteAmount.plainString)",
-            "当前仓位不会被立即修改"
+            hasExistingProtection ? "将替换当前方向已有保护单" : "当前仓位不会被立即修改"
         ]
         if takeProfitEnabled { lines.append("止盈：\(takeProfitText) USDT") }
         if stopLossEnabled { lines.append("止损：\(stopLossText) USDT") }
         lines.append("触发后将市价平掉该方向全部持仓。")
         return lines.joined(separator: "\n")
+    }
+
+    private func loadExistingValues() {
+        guard hasExistingProtection else { return }
+        let takeProfit = existingProtectionOrders.first { $0.type.contains("TAKE_PROFIT") }
+        let stopLoss = existingProtectionOrders.first {
+            $0.type.contains("STOP") && !$0.type.contains("TAKE_PROFIT")
+        }
+        takeProfitEnabled = takeProfit != nil
+        takeProfitText = takeProfit.map {
+            ($0.triggerPrice > 0 ? $0.triggerPrice : $0.price).plainString
+        } ?? ""
+        stopLossEnabled = stopLoss != nil
+        stopLossText = stopLoss.map {
+            ($0.triggerPrice > 0 ? $0.triggerPrice : $0.price).plainString
+        } ?? ""
     }
 
     private func decimal(_ text: String) -> Decimal? {
